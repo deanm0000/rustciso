@@ -43,6 +43,10 @@ source data or delete files. Embedded DuckLake row IDs and original row snapshot
 IDs are preserved. Logical record counts, `next_row_id` and table-wide value
 statistics do not change.
 
+The [hourly RT prices trigger](../rtprices/README.md) can also enqueue a
+single-day repack after successfully processing the first or last Los Angeles
+hour of that day, using its `repack_if_first` and `repack_if_last` flags.
+
 ## Azure runtime and failure behavior
 
 Sorting uses approximately 64 MiB input runs and eight-way streaming merge

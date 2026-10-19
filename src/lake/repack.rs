@@ -6,7 +6,7 @@ use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array};
 use datafusion::arrow::compute::{cast, filter_record_batch};
 use datafusion::arrow::datatypes::SchemaRef;
 use futures::TryStreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 mod sort;
@@ -16,7 +16,7 @@ const SNAPSHOT_ID: &str = "_ducklake_internal_snapshot_id";
 const ROW_ID_FIELD: &str = "2147483540";
 const SNAPSHOT_FIELD: &str = "2147483539";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
     pub table: String,

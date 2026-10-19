@@ -16,10 +16,12 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
+use chrono_tz::America::Los_Angeles;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 const QUEUE_NAME: &str = "rtprices";
+const REPACK_QUEUE_NAME: &str = "repack";
 const NOT_READY_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 const ERROR_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 const BACKLOG_ERROR_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -31,13 +33,75 @@ const READY_LAG: Duration = Duration::minutes(5);
 struct Job {
     startdatetime: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    get_next: Option<bool>,
+    get_next_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    get_prev_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repack_if_last: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repack_if_first: Option<bool>,
+}
+
+impl Job {
+    fn continuations(&self, start: DateTime<Utc>) -> Result<Vec<Job>> {
+        let mut jobs = Vec::new();
+        for (bound, step) in [
+            (&self.get_next_until, oasis::WINDOW),
+            (&self.get_prev_until, -oasis::WINDOW),
+        ] {
+            if let Some(bound) = bound {
+                let until = oasis::parse_oasis_time(bound).with_context(|| {
+                    if step > Duration::zero() {
+                        "invalid get_next_until"
+                    } else {
+                        "invalid get_prev_until"
+                    }
+                })?;
+                let next_start = start + step;
+                let forward = step > Duration::zero();
+                if (forward && next_start <= until) || (!forward && next_start >= until) {
+                    jobs.push(Job {
+                        startdatetime: oasis::format_oasis_time(next_start),
+                        get_next_until: if forward { Some(bound.clone()) } else { None },
+                        get_prev_until: if forward { None } else { Some(bound.clone()) },
+                        repack_if_last: self.repack_if_last,
+                        repack_if_first: self.repack_if_first,
+                    });
+                }
+            }
+        }
+        Ok(jobs)
+    }
+
+    fn repack(&self, start: DateTime<Utc>) -> Result<Option<lake::repack::Job>> {
+        let date = start.with_timezone(&Los_Angeles).date_naive();
+        let first = (start - oasis::WINDOW)
+            .with_timezone(&Los_Angeles)
+            .date_naive()
+            != date;
+        let last = (start + oasis::WINDOW)
+            .with_timezone(&Los_Angeles)
+            .date_naive()
+            != date;
+        if (self.repack_if_first == Some(true) && first)
+            || (self.repack_if_last == Some(true) && last)
+        {
+            Ok(Some(lake::repack::Job {
+                table: lake::TABLE.to_string(),
+                begin_date: date,
+                end_date: date.succ_opt().context("repack end date is out of range")?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 struct AppState {
     cfg: Config,
     http: reqwest::Client,
     queue: QueueClient,
+    repack_queue: QueueClient,
 }
 
 enum Outcome {
@@ -128,23 +192,31 @@ async fn requeue(
 
 async fn handle(state: &AppState, job: Job, log: &mut Vec<String>) -> Result<()> {
     let start = oasis::parse_oasis_time(&job.startdatetime)?;
+    let continuations = job.continuations(start)?;
+    let repack = job.repack(start)?;
     match load_hour(state, start, log).await {
         Ok(Outcome::Loaded) => {
-            if job.get_next.unwrap_or(false) {
-                let next_start = start + oasis::WINDOW;
-                let next = Job {
-                    startdatetime: oasis::format_oasis_time(next_start),
-                    get_next: Some(true),
-                };
+            for next in continuations {
+                let next_start = oasis::parse_oasis_time(&next.startdatetime)?;
                 let delay = next_visibility(next_start, Utc::now());
                 state
                     .queue
                     .send(&serde_json::to_string(&next)?, delay)
                     .await?;
                 log.push(format!(
-                    "queued next {} visible in {}s",
+                    "queued continuation {} visible in {}s",
                     next.startdatetime,
                     delay.as_secs()
+                ));
+            }
+            if let Some(repack) = repack {
+                state
+                    .repack_queue
+                    .send(&serde_json::to_string(&repack)?, std::time::Duration::ZERO)
+                    .await?;
+                log.push(format!(
+                    "queued repack for {} America/Los_Angeles",
+                    repack.begin_date
                 ));
             }
         }
@@ -183,7 +255,7 @@ async fn rtprices_handler(
         .and_then(|Json(r)| first_payload(r))
         .and_then(|v| {
             serde_json::from_value(v).context(
-                "payload must look like {\"startdatetime\":\"20261016T07:00-0000\",\"get_next\":true}",
+                "payload must look like {\"startdatetime\":\"20261016T07:00-0000\",\"get_next_until\":\"20261017T07:00-0000\",\"get_prev_until\":\"20261015T07:00-0000\",\"repack_if_last\":true,\"repack_if_first\":true}",
             )
         });
     let job = match job {
@@ -246,7 +318,13 @@ async fn main() -> Result<()> {
         .timeout(std::time::Duration::from_secs(180))
         .build()?;
     let queue = QueueClient::new(http.clone(), cfg.queue_account.clone(), QUEUE_NAME);
-    let state = Arc::new(AppState { cfg, http, queue });
+    let repack_queue = QueueClient::new(http.clone(), cfg.queue_account.clone(), REPACK_QUEUE_NAME);
+    let state = Arc::new(AppState {
+        cfg,
+        http,
+        queue,
+        repack_queue,
+    });
 
     let app = Router::new()
         .route("/rtprices", post(rtprices_handler))
@@ -266,6 +344,142 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn job(start: &str) -> Job {
+        Job {
+            startdatetime: start.to_string(),
+            get_next_until: None,
+            get_prev_until: None,
+            repack_if_last: None,
+            repack_if_first: None,
+        }
+    }
+
+    #[test]
+    fn continuation_bounds_are_inclusive_and_compare_instants() {
+        let mut j = job("20261016T07:00-0000");
+        let start = oasis::parse_oasis_time(&j.startdatetime).unwrap();
+        assert!(j.continuations(start).unwrap().is_empty());
+
+        j.get_next_until = Some("20261016T01:00-0700".into());
+        j.get_prev_until = Some("20261015T23:00-0700".into());
+        let children = j.continuations(start).unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].startdatetime, "20261016T08:00-0000");
+        assert_eq!(children[1].startdatetime, "20261016T06:00-0000");
+        for child in children {
+            let child_start = oasis::parse_oasis_time(&child.startdatetime).unwrap();
+            assert!(child.continuations(child_start).unwrap().is_empty());
+        }
+
+        j.get_next_until = Some("20261016T07:59-0000".into());
+        j.get_prev_until = Some("20261016T06:01-0000".into());
+        assert!(j.continuations(start).unwrap().is_empty());
+        j.get_next_until = Some("20261015T07:00-0000".into());
+        j.get_prev_until = Some("20261017T07:00-0000".into());
+        assert!(j.continuations(start).unwrap().is_empty());
+    }
+
+    #[test]
+    fn children_keep_direction_and_repack_flags_until_bounds() {
+        let mut j = job("20261016T07:00-0000");
+        j.get_next_until = Some("20261016T10:00-0000".into());
+        j.get_prev_until = Some("20261016T04:00-0000".into());
+        for flags in [
+            (Some(true), Some(false)),
+            (Some(false), Some(true)),
+            (Some(true), Some(true)),
+        ] {
+            j.repack_if_last = flags.0;
+            j.repack_if_first = flags.1;
+            let start = oasis::parse_oasis_time(&j.startdatetime).unwrap();
+            let children = j.continuations(start).unwrap();
+            assert_eq!(children.len(), 2);
+            assert_eq!(children[0].get_next_until, j.get_next_until);
+            assert_eq!(children[0].get_prev_until, None);
+            assert_eq!(children[1].get_prev_until, j.get_prev_until);
+            assert_eq!(children[1].get_next_until, None);
+            for mut child in children {
+                for step in 1..=3 {
+                    assert_eq!(child.repack_if_last, flags.0);
+                    assert_eq!(child.repack_if_first, flags.1);
+                    let encoded = serde_json::to_string(&child).unwrap();
+                    child = serde_json::from_str(&encoded).unwrap();
+                    let child_start = oasis::parse_oasis_time(&child.startdatetime).unwrap();
+                    let mut next = child.continuations(child_start).unwrap();
+                    if step == 3 {
+                        assert!(next.is_empty());
+                    } else {
+                        assert_eq!(next.len(), 1);
+                        child = next.pop().unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_continuation_bounds_are_errors() {
+        let mut j = job("20261016T07:00-0000");
+        let start = oasis::parse_oasis_time(&j.startdatetime).unwrap();
+        j.get_next_until = Some("invalid".into());
+        assert!(
+            j.continuations(start)
+                .unwrap_err()
+                .to_string()
+                .contains("get_next_until")
+        );
+        j.get_next_until = None;
+        j.get_prev_until = Some("invalid".into());
+        assert!(
+            j.continuations(start)
+                .unwrap_err()
+                .to_string()
+                .contains("get_prev_until")
+        );
+    }
+
+    #[test]
+    fn repack_uses_local_day_boundaries_including_dst() {
+        for (first, end, hours) in [
+            ("20261016T07:00-0000", "20261017T07:00-0000", 24),
+            ("20260308T08:00-0000", "20260309T07:00-0000", 23),
+            ("20261101T07:00-0000", "20261102T08:00-0000", 25),
+            ("20261231T08:00-0000", "20270101T08:00-0000", 24),
+        ] {
+            let start = oasis::parse_oasis_time(first).unwrap();
+            let end = oasis::parse_oasis_time(end).unwrap();
+            assert_eq!((end - start).num_hours(), hours);
+            for first_flag in [None, Some(false), Some(true)] {
+                for last_flag in [None, Some(false), Some(true)] {
+                    let mut j = job(first);
+                    j.repack_if_first = first_flag;
+                    j.repack_if_last = last_flag;
+                    for hour in 0..hours {
+                        let repack = j.repack(start + Duration::hours(hour)).unwrap();
+                        let expected = (first_flag == Some(true) && hour == 0)
+                            || (last_flag == Some(true) && hour == hours - 1);
+                        assert_eq!(repack.is_some(), expected, "{first} hour {hour}");
+                        if let Some(repack) = repack {
+                            repack.validate().unwrap();
+                            let payload = serde_json::to_value(&repack).unwrap();
+                            assert_eq!(
+                                payload,
+                                serde_json::json!({
+                                    "table": "ciso.rtprices",
+                                    "begin_date": start.with_timezone(&Los_Angeles).date_naive().to_string(),
+                                    "end_date": end.with_timezone(&Los_Angeles).date_naive().to_string(),
+                                })
+                            );
+                            let decoded: lake::repack::Job =
+                                serde_json::from_value(payload).unwrap();
+                            decoded.validate().unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn next_visibility_waits_for_hour_close() {
         let next = oasis::parse_oasis_time("20261016T08:00-0000").unwrap();
@@ -280,7 +494,10 @@ mod tests {
     #[test]
     fn job_roundtrip() {
         let j: Job = serde_json::from_str(r#"{"startdatetime":"20261016T07:00-0000"}"#).unwrap();
-        assert_eq!(j.get_next, None);
+        assert_eq!(j.get_next_until, None);
+        assert_eq!(j.get_prev_until, None);
+        assert_eq!(j.repack_if_last, None);
+        assert_eq!(j.repack_if_first, None);
         assert_eq!(
             serde_json::to_string(&j).unwrap(),
             r#"{"startdatetime":"20261016T07:00-0000"}"#
