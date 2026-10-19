@@ -66,6 +66,8 @@ sorting, merge readers, Parquet metadata and an open row group also use memory.
 Short-range groups must retain a whole node regardless of size.
 Deduplication adds a streaming pass sorted by the unique columns and descending
 download timestamp, followed by the normal `(node, utcbegin)` output sort.
+Parquet footer reads use a blob-size lookup and explicit bounded byte ranges;
+Azure Blob Storage does not support suffix-range requests.
 
 The app's `functionTimeout` is `-1`, which **requires an Azure Functions hosting
 plan supporting unbounded execution**. Azure platform restarts and scale-in can

@@ -20,7 +20,6 @@ use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryStreamExt};
 use object_store::buffered::BufWriter;
-use object_store::{GetOptions, GetRange};
 use std::ops::Range;
 
 const RUN_BYTES: usize = 64 * 1024 * 1024;
@@ -67,17 +66,10 @@ impl AsyncFileReader for BlobReader {
 impl MetadataSuffixFetch for &mut BlobReader {
     fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, ParquetResult<Bytes>> {
         async move {
+            // Azure rejects suffix ranges; resolve the footer against the blob size.
+            let size = self.store.head(&self.path).await.map_err(parquet_error)?.size;
             self.store
-                .get_opts(
-                    &self.path,
-                    GetOptions {
-                        range: Some(GetRange::Suffix(suffix as u64)),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(parquet_error)?
-                .bytes()
+                .get_range(&self.path, size.saturating_sub(suffix as u64)..size)
                 .await
                 .map_err(parquet_error)
         }
@@ -481,6 +473,20 @@ mod tests {
     use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn footer_reads_use_bounded_ranges_and_clamp_to_file_size() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = ObjPath::from("footer");
+        store.put(&path, Bytes::from_static(b"0123456789").into()).await.unwrap();
+        let mut reader = BlobReader { store, path };
+        for (suffix, expected) in [(4, "6789"), (10, "0123456789"), (100, "0123456789")] {
+            assert_eq!(
+                (&mut reader).fetch_suffix(suffix).await.unwrap().as_ref(),
+                expected.as_bytes()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn remote_sort_preserves_rows_and_node_statistics_across_batches() {
