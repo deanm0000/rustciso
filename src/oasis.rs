@@ -12,6 +12,20 @@ const RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_millis(51
 const RATE_LIMIT_RETRIES: usize = 2;
 /// OASIS error code for "No data returned for the specified selection".
 const NO_DATA_ERR_CODE: &str = "1000";
+const PROCESSING_ERR_CODE: &str = "1015";
+const PROCESSING_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const PROCESSING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug)]
+struct ProcessingError(String);
+
+impl std::fmt::Display for ProcessingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OASIS error {PROCESSING_ERR_CODE}: {}", self.0)
+    }
+}
+
+impl std::error::Error for ProcessingError {}
 
 pub fn parse_oasis_time(s: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_str(s.trim(), OASIS_FMT)
@@ -41,13 +55,41 @@ pub enum OasisResult {
 
 pub async fn fetch(client: &reqwest::Client, start: DateTime<Utc>, log: &mut Vec<String>) -> Result<OasisResult> {
     let url = build_url(start);
+    fetch_url(client, &url, log).await
+}
+
+async fn fetch_url(client: &reqwest::Client, url: &str, log: &mut Vec<String>) -> Result<OasisResult> {
     let mut attempt = 0;
+    let mut body = fetch_body(client, url, log, &mut attempt).await?;
+    let mut deadline = None;
+    loop {
+        let processing = match parse_zip(&body) {
+            Err(err) if err.is::<ProcessingError>() => err,
+            result => return result,
+        };
+        let deadline = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + PROCESSING_TIMEOUT);
+        log.push(format!("{processing}; waiting {PROCESSING_WAIT:?} before retry (60s limit)"));
+        body = tokio::time::timeout_at(deadline, async {
+            tokio::time::sleep(PROCESSING_WAIT).await;
+            fetch_body(client, url, log, &mut attempt).await
+        })
+        .await
+        .with_context(|| format!("OASIS still processing after 60s: {processing}"))??;
+    }
+}
+
+async fn fetch_body(
+    client: &reqwest::Client,
+    url: &str,
+    log: &mut Vec<String>,
+    attempt: &mut usize,
+) -> Result<Bytes> {
     let body = loop {
         log.push(format!("GET {url}"));
-        let resp = client.get(&url).send().await.context("OASIS request failed")?;
+        let resp = client.get(url).send().await.context("OASIS request failed")?;
         let status = resp.status();
-        if status == StatusCode::TOO_MANY_REQUESTS && attempt < RATE_LIMIT_RETRIES {
-            attempt += 1;
+        if status == StatusCode::TOO_MANY_REQUESTS && *attempt < RATE_LIMIT_RETRIES {
+            *attempt += 1;
             log.push(format!("OASIS 429, waiting {RATE_LIMIT_WAIT:?} (retry {attempt}/{RATE_LIMIT_RETRIES})"));
             tokio::time::sleep(RATE_LIMIT_WAIT).await;
             continue;
@@ -57,7 +99,7 @@ pub async fn fetch(client: &reqwest::Client, start: DateTime<Utc>, log: &mut Vec
         }
         break resp.bytes().await.context("reading OASIS body")?;
     };
-    parse_zip(&body)
+    Ok(body)
 }
 
 pub fn parse_zip(body: &[u8]) -> Result<OasisResult> {
@@ -81,6 +123,7 @@ pub fn parse_zip(body: &[u8]) -> Result<OasisResult> {
     }
     match xml_errors.into_iter().next() {
         Some((Some(code), desc)) if code == NO_DATA_ERR_CODE => Ok(OasisResult::NotReady(desc)),
+        Some((Some(code), desc)) if code == PROCESSING_ERR_CODE => Err(ProcessingError(desc).into()),
         Some((code, desc)) => Err(anyhow!("OASIS error {}: {desc}", code.unwrap_or_default())),
         None => Err(anyhow!("OASIS zip contained no csv or xml files")),
     }
@@ -105,6 +148,7 @@ fn parse_xml_error(xml: &str) -> (Option<String>, String) {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
     const NO_DATA_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <m:OASISReport xmlns:m="http://www.caiso.com/soa/OASISReport_v1.xsd">
@@ -113,6 +157,41 @@ mod tests {
 <m:ERR_CODE>1000</m:ERR_CODE>
 <m:ERR_DESC>No data returned for the specified selection</m:ERR_DESC>
 </m:ERROR></m:RTO></m:MessagePayload></m:OASISReport>"#;
+
+    fn processing_zip() -> Vec<u8> {
+        zip_of(&[("error.xml", &NO_DATA_XML
+            .replace(">1000<", ">1015<")
+            .replace(
+                "No data returned for the specified selection",
+                "GroupZip DownLoad is in Processing, Please Submit request after Sometime",
+            ))])
+    }
+
+    struct TestServer {
+        url: String,
+        requests: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn serve(responses: Vec<Vec<u8>>) -> TestServer {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let app = axum::Router::new().route("/", axum::routing::get(move || {
+            let index = count.fetch_add(1, Ordering::SeqCst).min(responses.len() - 1);
+            let body = responses[index].clone();
+            async move { body }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        TestServer { url, requests, task }
+    }
 
     fn zip_of(files: &[(&str, &str)]) -> Vec<u8> {
         let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -139,8 +218,58 @@ mod tests {
 
     #[test]
     fn other_xml_error_is_error() {
-        let z = zip_of(&[("x.xml", &NO_DATA_XML.replace(">1000<", ">1015<"))]);
+        let z = zip_of(&[("x.xml", &NO_DATA_XML.replace(">1000<", ">9999<"))]);
         assert!(parse_zip(&z).is_err());
+    }
+
+    #[test]
+    fn detects_processing_inside_zip() {
+        let err = parse_zip(&processing_zip()).unwrap_err();
+        assert!(err.is::<ProcessingError>());
+        assert!(err.to_string().contains("GroupZip DownLoad is in Processing"));
+    }
+
+    #[tokio::test]
+    async fn retries_processing_until_csvs_are_ready() {
+        let server = serve(vec![processing_zip(), processing_zip(), zip_of(&[("a.csv", "h\n1\n")])]).await;
+        let mut log = Vec::new();
+        let started = tokio::time::Instant::now();
+        let result = fetch_url(&reqwest::Client::new(), &server.url, &mut log).await.unwrap();
+        assert!(matches!(result, OasisResult::Csvs(csvs) if csvs.len() == 1));
+        assert_eq!(server.requests.load(Ordering::SeqCst), 3);
+        assert!(started.elapsed() >= PROCESSING_WAIT * 2);
+        assert_eq!(log.iter().filter(|line| line.contains("waiting 5s")).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn stops_processing_retries_after_one_minute() {
+        let server = serve(vec![processing_zip()]).await;
+        let mut log = Vec::new();
+        let started = tokio::time::Instant::now();
+        let err = fetch_url(&reqwest::Client::new(), &server.url, &mut log).await.unwrap_err();
+        assert!(err.to_string().contains("still processing after 60s"));
+        assert!(err.to_string().contains("1015"));
+        assert!(started.elapsed() >= PROCESSING_TIMEOUT);
+        assert!(started.elapsed() < PROCESSING_TIMEOUT + PROCESSING_WAIT);
+        let requests = server.requests.load(Ordering::SeqCst);
+        assert!((2..=13).contains(&requests), "unexpected request count: {requests}");
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_other_oasis_responses() {
+        for (xml, not_ready) in [
+            (NO_DATA_XML.to_string(), true),
+            (NO_DATA_XML.replace(">1000<", ">9999<"), false),
+        ] {
+            let server = serve(vec![zip_of(&[("error.xml", &xml)])]).await;
+            let result = fetch_url(&reqwest::Client::new(), &server.url, &mut Vec::new()).await;
+            if not_ready {
+                assert!(matches!(result.unwrap(), OasisResult::NotReady(_)));
+            } else {
+                assert!(result.unwrap_err().to_string().contains("9999"));
+            }
+            assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]

@@ -36,6 +36,12 @@ visibility capped at seven days. Historical hours are immediately visible.
 Not-ready responses and load failures retry the original job with all its
 options intact; they do not emit continuations or repack jobs.
 
+OASIS ZIP responses containing error `1015` ("GroupZip DownLoad is in
+Processing") are retried every five seconds for up to one minute after the
+first processing response. This limit includes subsequent requests and
+response reads. If the limit expires, the load fails and the original job
+is retried through the usual failure path. Other OASIS errors are unchanged.
+
 If `repack_if_first` is true and the loaded hour is the first hour of its
 `America/Los_Angeles` date, or `repack_if_last` is true and it is the last hour,
 one message is sent immediately to the [repack queue](../repack/README.md).
