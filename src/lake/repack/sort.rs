@@ -2,6 +2,7 @@ use super::*;
 use datafusion::arrow::compute::{
     SortColumn, SortOptions, concat_batches, lexsort_to_indices, take,
 };
+use datafusion::arrow::row::{OwnedRow, RowConverter, SortField};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::parquet::arrow::AsyncArrowWriter;
 use datafusion::parquet::arrow::ParquetRecordBatchStreamBuilder;
@@ -110,6 +111,7 @@ pub(super) struct Runs {
     batches: Vec<RecordBatch>,
     bytes: usize,
     paths: Vec<ObjPath>,
+    ordering: Vec<(String, bool)>,
 }
 
 impl Runs {
@@ -118,7 +120,16 @@ impl Runs {
             batches: Vec::new(),
             bytes: 0,
             paths: Vec::new(),
+            ordering: vec![("node".into(), false), ("utcbegin".into(), false)],
         }
+    }
+
+    pub(super) fn for_unique(unique: &[String]) -> Self {
+        let mut runs = Self::new();
+        runs.ordering = unique.iter().map(|name| (name.clone(), false)).collect();
+        runs.ordering.push(("downloaded_at".into(), true));
+        runs.ordering.push((ROW_ID.into(), true));
+        runs
     }
 
     pub(super) async fn push(&mut self, batch: RecordBatch, work: &mut Work) -> Result<()> {
@@ -138,17 +149,18 @@ impl Runs {
             return Ok(());
         }
         let batch = concat_batches(&self.batches[0].schema(), &self.batches)?;
-        let keys = ["node", "utcbegin"]
-            .map(|name| {
+        let keys = self
+            .ordering
+            .iter()
+            .map(|(name, descending)| {
                 Ok(SortColumn {
                     values: batch.column(batch.schema().index_of(name)?).clone(),
                     options: Some(SortOptions {
-                        descending: false,
+                        descending: *descending,
                         nulls_first: false,
                     }),
                 })
             })
-            .into_iter()
             .collect::<Result<Vec<_>>>()?;
         let indices = lexsort_to_indices(&keys, None)?;
         let sorted = RecordBatch::try_new(
@@ -160,6 +172,8 @@ impl Runs {
                 .collect::<std::result::Result<_, _>>()?,
         )?;
         let path = work.temp_path();
+        eprintln!("repack: writing sorted run {path}: {} rows, {} buffered bytes",
+            sorted.num_rows(), self.bytes);
         let mut writer = AsyncArrowWriter::try_new(
             BufWriter::new(work.store.clone(), path.clone()),
             sorted.schema(),
@@ -183,10 +197,80 @@ impl Runs {
         if self.paths.is_empty() {
             return Ok(None);
         }
+        let stream = self.stream(work).await?;
+        eprintln!("repack: writing final output from {} runs; node-only={node_only}; temporary prefix={}",
+            self.paths.len(), work.tmp);
+        let file = write_output(work, stream, node_only, cols).await?;
+        for path in &self.paths {
+            work.remove_temp(path).await?;
+        }
+        Ok(Some(file))
+    }
+
+    pub(super) async fn deduplicate(
+        mut self,
+        work: &mut Work,
+        unique: &[String],
+    ) -> Result<(Self, i64)> {
+        self.flush(work).await?;
+        let mut output = Self::new();
+        if self.paths.is_empty() {
+            return Ok((output, 0));
+        }
+        let mut stream = self.stream(work).await?;
+        let schema = stream.schema();
+        let indices = unique
+            .iter()
+            .map(|name| schema.index_of(name))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let converter = RowConverter::new(
+            indices
+                .iter()
+                .map(|i| SortField::new(schema.field(*i).data_type().clone()))
+                .collect(),
+        )?;
+        let mut previous: Option<OwnedRow> = None;
+        let mut removed = 0i64;
+        while let Some(batch) = stream.try_next().await? {
+            let keys = converter.convert_columns(
+                &indices
+                    .iter()
+                    .map(|i| batch.column(*i).clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            let keep = BooleanArray::from(
+                (0..batch.num_rows())
+                    .map(|i| {
+                        let row = keys.row(i);
+                        if previous.as_ref().is_some_and(|last| last.row() == row) {
+                            removed += 1;
+                            false
+                        } else {
+                            previous = Some(row.owned());
+                            true
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            output
+                .push(filter_record_batch(&batch, &keep)?, work)
+                .await?;
+        }
+        drop(stream);
+        for path in &self.paths {
+            work.remove_temp(path).await?;
+        }
+        Ok((output, removed))
+    }
+
+    async fn stream(&mut self, work: &mut Work) -> Result<SendableRecordBatchStream> {
+        self.flush(work).await?;
         while self.paths.len() > MERGE_FAN_IN {
+            eprintln!("repack: merging {} runs with fan-in {MERGE_FAN_IN} under {}",
+                self.paths.len(), work.tmp);
             let mut next = Vec::new();
             for chunk in self.paths.chunks(MERGE_FAN_IN) {
-                let mut stream = merged(work.store.clone(), chunk).await?;
+                let mut stream = merged(work.store.clone(), chunk, &self.ordering).await?;
                 let path = work.temp_path();
                 let mut writer = AsyncArrowWriter::try_new(
                     BufWriter::new(work.store.clone(), path.clone()),
@@ -204,18 +288,14 @@ impl Runs {
             }
             self.paths = next;
         }
-        let stream = merged(work.store.clone(), &self.paths).await?;
-        let file = write_output(work, stream, node_only, cols).await?;
-        for path in &self.paths {
-            work.remove_temp(path).await?;
-        }
-        Ok(Some(file))
+        merged(work.store.clone(), &self.paths, &self.ordering).await
     }
 }
 
 async fn merged(
     store: Arc<dyn ObjectStore>,
     paths: &[ObjPath],
+    ordering: &[(String, bool)],
 ) -> Result<SendableRecordBatchStream> {
     let mut config = SessionConfig::new().with_target_partitions(1);
     config
@@ -239,17 +319,17 @@ async fn merged(
     let union = UnionExec::try_new(plans)?;
     let schema = datafusion::physical_plan::ExecutionPlan::schema(union.as_ref());
     let ordering = LexOrdering::new(
-        ["node", "utcbegin"]
-            .map(|name| {
+        ordering
+            .iter()
+            .map(|(name, descending)| {
                 Ok(PhysicalSortExpr::new(
                     Arc::new(PhysicalColumn::new(name, schema.index_of(name)?)),
                     SortOptions {
-                        descending: false,
+                        descending: *descending,
                         nulls_first: false,
                     },
                 ))
             })
-            .into_iter()
             .collect::<Result<Vec<_>>>()?,
     )
     .context("empty sort ordering")?;
@@ -555,6 +635,139 @@ mod tests {
                     .map(String::as_str)
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn unique_keeps_latest_across_runs_and_batches_then_restores_output_order() {
+        for (unique, expected_ids) in [
+            (vec!["utcbegin", "node"], vec![18097, 18099, 18096, 18098]),
+            (vec!["node"], vec![18099, 18098]),
+            (vec!["rtlmp"], vec![18099]),
+        ] {
+            let unique: Vec<String> = unique.into_iter().map(String::from).collect();
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let mut work = Work::new(store.clone(), "table/".into());
+            let input = crate::transform::target_schema();
+            let meta = TableMeta {
+                table_id: 1,
+                root: String::new(),
+                columns: input
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, field)| {
+                        (
+                            field.name().clone(),
+                            Column {
+                                id: i as i64,
+                                ty: match field.data_type() {
+                                    DataType::Utf8 => "varchar",
+                                    DataType::Float64 => "float64",
+                                    _ => "timestamptz",
+                                }
+                                .into(),
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+            let data_schema = schema(&meta).unwrap();
+            let target = with_identity(&data_schema);
+            let cols = resolve_columns(&meta, &data_schema).unwrap();
+            let mut runs = Runs::for_unique(&unique);
+            for run in 0..10 {
+                let n = 2000;
+                let mut arrays: Vec<ArrayRef> = vec![
+                    Arc::new(
+                        TimestampMicrosecondArray::from_iter_values(
+                            (0..n).map(|i| (i % 4 / 2) as i64),
+                        )
+                        .with_timezone("UTC"),
+                    ),
+                    Arc::new(StringArray::from_iter_values(
+                        (0..n).map(|i| if i % 2 == 0 { "B" } else { "A" }),
+                    )),
+                ];
+                arrays.extend(
+                    (0..5).map(|_| Arc::new(Float64Array::from(vec![None; n])) as ArrayRef),
+                );
+                arrays.push(Arc::new(
+                    TimestampMicrosecondArray::from(vec![
+                        if run == 9 { None } else { Some(run) };
+                        n
+                    ])
+                    .with_timezone("UTC"),
+                ));
+                let batch = RecordBatch::try_new(data_schema.clone(), arrays).unwrap();
+                let source = Source {
+                    id: run,
+                    path: String::new(),
+                    relative: true,
+                    rows: n as i64,
+                    row_id_start: Some(100 + run * n as i64),
+                    begin_snapshot: 42,
+                    delete: None,
+                };
+                let batch = normalize(&batch, &target, &source, 0).unwrap();
+                runs.push(batch, &mut work).await.unwrap();
+                runs.flush(&mut work).await.unwrap();
+            }
+            let (runs, removed) = runs.deduplicate(&mut work, &unique).await.unwrap();
+            assert_eq!(removed, 20_000 - expected_ids.len() as i64);
+            let file = runs.finish(&mut work, true, &cols).await.unwrap().unwrap();
+            assert_eq!(file.rows, expected_ids.len() as i64);
+            assert!(file.stats.iter().all(|s| s.value_count == file.rows));
+            let mut stream = reader(store, ObjPath::from(format!("table/{}", file.name)))
+                .await
+                .unwrap();
+            let mut batches = Vec::new();
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                batches.push(batch);
+            }
+            let batch = concat_batches(&target, &batches).unwrap();
+            assert_eq!(
+                batch
+                    .column(target.index_of(ROW_ID).unwrap())
+                    .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+                    .values()
+                    .as_ref(),
+                expected_ids.as_slice(),
+            );
+            assert!(
+                batch
+                    .column(target.index_of(SNAPSHOT_ID).unwrap())
+                    .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+                    .values()
+                    .iter()
+                    .all(|id| *id == 42)
+            );
+            assert!(
+                batch
+                    .column(target.index_of("downloaded_at").unwrap())
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .iter()
+                    .all(|time| time == Some(8))
+            );
+            assert!(work.temps.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn unique_handles_empty_input() {
+        let mut work = Work::new(Arc::new(InMemory::new()), "table/".into());
+        let unique = vec!["node".into()];
+        let (runs, removed) = Runs::for_unique(&unique)
+            .deduplicate(&mut work, &unique)
+            .await
+            .unwrap();
+        assert_eq!(removed, 0);
+        assert!(
+            runs.finish(&mut work, false, &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(work.temps.is_empty());
     }
 
     #[tokio::test]

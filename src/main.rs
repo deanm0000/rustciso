@@ -90,6 +90,7 @@ impl Job {
                 table: lake::TABLE.to_string(),
                 begin_date: date,
                 end_date: date.succ_opt().context("repack end date is out of range")?,
+                unique: None,
             }))
         } else {
             Ok(None)
@@ -301,6 +302,7 @@ async fn repack_handler(
         }
     };
     let mut log = vec![format!("repack job {job:?}")];
+    eprintln!("{}", log[0]);
     match lake::repack::run(&state.cfg, &job, &mut log).await {
         Ok(()) => respond(StatusCode::OK, log),
         Err(e) => {

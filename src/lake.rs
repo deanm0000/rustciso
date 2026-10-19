@@ -114,6 +114,40 @@ fn join_dir(base: &str, rel: &str) -> String {
     out
 }
 
+async fn has_inlined_rows(
+    c: &impl GenericClient,
+    table_id: i64,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<bool> {
+    let tables = c
+        .query(
+            "SELECT table_name FROM ducklake.ducklake_inlined_data_tables WHERE table_id = $1",
+            &[&table_id],
+        )
+        .await
+        .context("reading inlined data tables")?;
+    for r in tables {
+        let name: String = r.get(0);
+        let has_rows: bool = c
+            .query_one(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM ducklake.\"{}\" WHERE end_snapshot IS NULL
+                       AND utcbegin::timestamptz >= $1 AND utcbegin::timestamptz < $2)",
+                    name.replace('"', "\"\"")
+                ),
+                &[&start, &end],
+            )
+            .await
+            .with_context(|| format!("checking inlined rows in {name}"))?
+            .get(0);
+        if has_rows {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 async fn table_meta(c: &impl GenericClient, schema: &str, table: &str) -> Result<TableMeta> {
     let row = c
         .query_opt(
@@ -448,30 +482,8 @@ async fn try_register(
         }
     }
 
-    let inlined = tx
-        .query(
-            "SELECT table_name FROM ducklake.ducklake_inlined_data_tables WHERE table_id = $1",
-            &[&table_id],
-        )
-        .await
-        .context("reading inlined data tables")?;
-    for r in inlined {
-        let name: String = r.get(0);
-        let has_rows: bool = tx
-            .query_one(
-                &format!(
-                    "SELECT EXISTS (SELECT 1 FROM ducklake.\"{}\" WHERE end_snapshot IS NULL
-                       AND utcbegin::timestamptz >= $1 AND utcbegin::timestamptz < $2)",
-                    name.replace('"', "\"\"")
-                ),
-                &[&start, &end],
-            )
-            .await
-            .with_context(|| format!("checking inlined rows in {name}"))?
-            .get(0);
-        if has_rows {
-            return Ok(Attempt::NeedsSqlDelete);
-        }
+    if has_inlined_rows(&tx, table_id, start, end).await? {
+        return Ok(Attempt::NeedsSqlDelete);
     }
 
     let snapshot_id = prev_snap + 1;

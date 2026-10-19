@@ -7,7 +7,8 @@ Enqueue a base64-encoded JSON message on the `repack` Azure Storage queue
 {
   "table": "rtprices",
   "begin_date": "2026-01-01",
-  "end_date": "2026-10-01"
+  "end_date": "2026-10-01",
+  "unique": ["utcbegin", "node"]
 }
 ```
 
@@ -16,8 +17,15 @@ define the half-open interval `[begin_date, end_date)` at midnight in
 `America/Los_Angeles`, with daylight-saving rules applied independently to each
 boundary. Stored `utcbegin` timestamps remain UTC. For example, the range above
 is `[2026-01-01T08:00:00Z, 2026-10-01T07:00:00Z)`. A local day spanning a
-daylight-saving transition can contain 23 or 25 hours. No rows are deduplicated
-or aggregated.
+daylight-saving transition can contain 23 or 25 hours.
+
+`unique` is an optional list of column names. When supplied, only rows within
+the requested interval are deduplicated by that combination of columns, keeping
+the entire row with the latest `downloaded_at`. Equal timestamps are broken by
+the highest DuckLake row ID; null timestamps sort behind non-null timestamps.
+Null key values compare equal. The list must be nonempty, contain distinct
+existing columns, and the table must have microsecond `timestamptz downloaded_at`.
+Omit `unique` or set it to `null` to preserve all rows without deduplication.
 
 ## Output layout
 
@@ -40,8 +48,9 @@ or aggregated.
 All replacements are published in one atomic DuckLake compaction snapshot.
 Sources remain available for time travel; this trigger never physically deletes
 source data or delete files. Embedded DuckLake row IDs and original row snapshot
-IDs are preserved. Logical record counts, `next_row_id` and table-wide value
-statistics do not change.
+IDs of surviving rows are preserved. Logical record counts decrease by the
+number of duplicates removed. `next_row_id` does not change, and table-wide
+value statistics remain conservative bounds.
 
 The [hourly RT prices trigger](../rtprices/README.md) can also enqueue a
 single-day repack after successfully processing the first or last Los Angeles
@@ -55,11 +64,20 @@ passes. Intermediate Parquet runs are stored beneath the table's
 These are sort-buffer targets, not a total process memory cap: decoding,
 sorting, merge readers, Parquet metadata and an open row group also use memory.
 Short-range groups must retain a whole node regardless of size.
+Deduplication adds a streaming pass sorted by the unique columns and descending
+download timestamp, followed by the normal `(node, utcbegin)` output sort.
 
 The app's `functionTimeout` is `-1`, which **requires an Azure Functions hosting
 plan supporting unbounded execution**. Azure platform restarts and scale-in can
 still interrupt an invocation. This setting applies to the whole Function App.
 No durable continuation/checkpoint is implemented; a retry starts sorting again.
+
+Progress is written immediately to the handler console, rather than waiting for
+the invocation response: catalog checks, each source file, sorted runs, merge
+passes, output sizes, commit attempts and cleanup. Logs include the unique
+temporary prefix and elapsed times. Handled failures include the error chain in
+the custom-handler response. Inlined timestamps are cast from DuckLake's text
+representation before checking the requested UTC interval.
 
 On normal success or handled failure, temporary runs are deleted. If an
 invocation is terminated, its temporary prefix can remain; configure an
@@ -92,6 +110,13 @@ they are never read as if they had no deletes.
 
 ```sh
 cargo test lake::repack
+```
+
+With the app's environment variables set, the read-only catalog regression test
+also verifies timestamp parameters against real inlined tables:
+
+```sh
+cargo test inlined_text_timestamps_accept_datetime_parameters -- --ignored
 ```
 
 Tests use an in-memory object store with the same range-read and multipart

@@ -16,16 +16,34 @@ const SNAPSHOT_ID: &str = "_ducklake_internal_snapshot_id";
 const ROW_ID_FIELD: &str = "2147483540";
 const SNAPSHOT_FIELD: &str = "2147483539";
 
+fn progress(log: &mut Vec<String>, message: String) {
+    eprintln!("repack: {message}");
+    log.push(message);
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
     pub table: String,
     pub begin_date: NaiveDate,
     pub end_date: NaiveDate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique: Option<Vec<String>>,
 }
 
 impl Job {
     pub fn validate(&self) -> Result<()> {
+        if let Some(unique) = &self.unique {
+            if unique.is_empty() {
+                bail!("unique must contain at least one column");
+            }
+            let mut seen = HashSet::new();
+            for name in unique {
+                if name.is_empty() || !seen.insert(name) {
+                    bail!("unique columns must be nonempty and distinct");
+                }
+            }
+        }
         let parts: Vec<_> = self.table.split('.').collect();
         if parts.len() > 2
             || parts
@@ -44,6 +62,23 @@ impl Job {
             .context("date is out of range")?;
         self.start()?;
         self.end()?;
+        Ok(())
+    }
+
+    fn validate_schema(&self, schema: &SchemaRef) -> Result<()> {
+        if let Some(unique) = &self.unique {
+            for name in unique {
+                schema
+                    .index_of(name)
+                    .with_context(|| format!("unknown unique column {name:?}"))?;
+            }
+            if !matches!(
+                schema.field_with_name("downloaded_at")?.data_type(),
+                DataType::Timestamp(TimeUnit::Microsecond, _)
+            ) {
+                bail!("deduplication requires microsecond timestamptz downloaded_at");
+            }
+        }
         Ok(())
     }
 
@@ -112,7 +147,7 @@ impl Work {
     async fn cleanup(&mut self, log: &mut Vec<String>) {
         for path in self.temps.iter().chain(&self.outputs) {
             if let Err(e) = self.store.delete(path).await {
-                log.push(format!("could not clean up {path}: {e}"));
+                progress(log, format!("could not clean up {path}: {e}"));
             }
         }
     }
@@ -443,17 +478,30 @@ async fn prepare(
     log: &mut Vec<String>,
 ) -> Result<Vec<FileInfo>> {
     let data_schema = schema(meta)?;
+    job.validate_schema(&data_schema)?;
     let target = with_identity(&data_schema);
     let cols = resolve_columns(meta, &data_schema)?;
     let mut runs = [sort::Runs::new(), sort::Runs::new(), sort::Runs::new()];
+    if let Some(unique) = &job.unique {
+        runs[1] = sort::Runs::for_unique(unique);
+    }
     let mut live_rows = 0i64;
-    for source in sources {
-        let mut deleted = Deletes::open(cfg, meta, source).await?;
+    for (index, source) in sources.iter().enumerate() {
+        let started = std::time::Instant::now();
+        progress(log, format!(
+            "reading source {}/{}: id={}, rows={}, deletes={}",
+            index + 1, sources.len(), source.id, source.rows,
+            source.delete.as_ref().map_or(0, |d| d.count)
+        ));
+        let mut deleted = Deletes::open(cfg, meta, source).await
+            .with_context(|| format!("opening deletes for source {}", source.id))?;
         let full = location(meta, &source.path, source.relative);
         let (store, path) = object_store_for(cfg, &full)?;
-        let mut stream = sort::reader(store, ObjPath::from(path)).await?;
+        let mut stream = sort::reader(store, ObjPath::from(path)).await
+            .with_context(|| format!("opening source {} at {full}", source.id))?;
         let mut offset = 0i64;
-        while let Some(batch) = stream.try_next().await? {
+        while let Some(batch) = stream.try_next().await
+            .with_context(|| format!("reading source {} at row {offset}", source.id))? {
             let normalized = normalize(&batch, &target, source, offset)?;
             let keep = deleted.mask(offset, batch.num_rows()).await?;
             offset += batch.num_rows() as i64;
@@ -469,11 +517,25 @@ async fn prepare(
         if deleted.peek().await?.is_some() {
             bail!("unconsumed delete positions for source {}", source.id);
         }
+        progress(log, format!(
+            "read source {}: {offset} rows in {:.1}s; total live rows={live_rows}",
+            source.id, started.elapsed().as_secs_f64()
+        ));
     }
     let mut files = Vec::new();
+    let mut removed = 0i64;
     for (i, run) in runs.into_iter().enumerate() {
+        progress(log, format!("merging {} region", ["before", "in-range", "after"][i]));
+        let run = if i == 1 && let Some(unique) = &job.unique {
+            let (run, count) = run.deduplicate(work, unique).await?;
+            removed = count;
+            progress(log, format!("deduplicated by {unique:?}: removed {removed} rows"));
+            run
+        } else {
+            run
+        };
         if let Some(file) = run.finish(work, i != 1 || job.node_only(), &cols).await? {
-            log.push(format!(
+            progress(log, format!(
                 "{}: {} rows, {} bytes in {}",
                 ["before", "in-range", "after"][i],
                 file.rows,
@@ -483,35 +545,15 @@ async fn prepare(
             files.push(file);
         }
     }
-    if files.iter().map(|f| f.rows).sum::<i64>() != live_rows {
+    if files.iter().map(|f| f.rows).sum::<i64>() != live_rows - removed {
         bail!("repack row count mismatch");
     }
     Ok(files)
 }
 
 async fn check_inlined(c: &impl GenericClient, table_id: i64, job: &Job) -> Result<()> {
-    for r in c
-        .query(
-            "SELECT table_name FROM ducklake.ducklake_inlined_data_tables WHERE table_id = $1",
-            &[&table_id],
-        )
-        .await?
-    {
-        let name: String = r.get(0);
-        let exists: bool = c
-            .query_one(
-                &format!(
-                    "SELECT EXISTS (SELECT 1 FROM ducklake.\"{}\" WHERE end_snapshot IS NULL
-             AND utcbegin >= $1 AND utcbegin < $2)",
-                    name.replace('"', "\"\"")
-                ),
-                &[&job.start()?, &job.end()?],
-            )
-            .await?
-            .get(0);
-        if exists {
-            bail!("range contains inlined data; flush it to Parquet before repacking");
-        }
+    if has_inlined_rows(c, table_id, job.start()?, job.end()?).await? {
+        bail!("range contains inlined data; flush it to Parquet before repacking");
     }
     Ok(())
 }
@@ -548,6 +590,14 @@ async fn commit(
     if table_meta(&tx, schema_name, table_name).await? != *meta {
         bail!("table metadata changed while sorting; retry the job");
     }
+    let removed = selected
+        .iter()
+        .map(|s| s.rows - s.delete.as_ref().map_or(0, |d| d.count))
+        .sum::<i64>()
+        - files.iter().map(|f| f.rows).sum::<i64>();
+    if removed < 0 || (job.unique.is_none() && removed != 0) {
+        bail!("invalid repack logical row count change: {removed}");
+    }
     let snapshot_id = prev + 1;
     tx.execute(
         "INSERT INTO ducklake.ducklake_snapshot
@@ -567,7 +617,11 @@ async fn commit(
          VALUES ($1, $2, $3, $4, NULL)",
         &[
             &snapshot_id,
-            &format!("compacted_table:{}", meta.table_id),
+            &if removed > 0 {
+                format!("compacted_table:{0},deleted_from_table:{0}", meta.table_id)
+            } else {
+                format!("compacted_table:{}", meta.table_id)
+            },
             &AUTHOR,
             &format!(
                 "repack {} [{}, {}) America/Los_Angeles",
@@ -633,14 +687,15 @@ async fn commit(
             .await?;
         }
     }
-    // Compaction changes bytes, not logical rows, row IDs or table-wide value statistics.
+    // Deleted rows leave safe, conservative column bounds and do not reuse row IDs.
     let updated = tx
         .execute(
             "UPDATE ducklake.ducklake_table_stats SET
          file_size_bytes = (SELECT COALESCE(SUM(file_size_bytes),0)::bigint
-           FROM ducklake.ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL)
+           FROM ducklake.ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL),
+         record_count = record_count - $2
          WHERE table_id = $1",
-            &[&meta.table_id],
+            &[&meta.table_id, &removed],
         )
         .await?;
     if updated != 1 {
@@ -652,6 +707,10 @@ async fn commit(
 
 pub async fn run(cfg: &Config, job: &Job, log: &mut Vec<String>) -> Result<()> {
     job.validate()?;
+    let started = std::time::Instant::now();
+    progress(log, format!(
+        "{} [{}, {}) UTC: connecting to catalog", job.table, job.start()?, job.end()?
+    ));
     let mut client = connect(cfg).await?;
     let (schema_name, table_name) = job.names();
     let meta = table_meta(&client, schema_name, table_name).await?;
@@ -660,52 +719,57 @@ pub async fn run(cfg: &Config, job: &Job, log: &mut Vec<String>) -> Result<()> {
         .get("utcbegin")
         .context("table has no utcbegin column")?
         .id;
-    schema(&meta)?;
+    job.validate_schema(&schema(&meta)?)?;
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
         .read_only(true)
         .start()
         .await?;
+    progress(log, format!("checking inlined rows and source files for table {}", meta.table_id));
     check_inlined(&tx, meta.table_id, job).await?;
     let selected = sources(&tx, meta.table_id, utc_col, job).await?;
     tx.commit().await?;
     if selected.is_empty() {
-        log.push("no source files overlap the requested range".into());
+        progress(log, "no source files overlap the requested range".into());
         return Ok(());
     }
-    log.push(format!(
+    progress(log, format!(
         "repacking {} files; node-only row groups: {}",
         selected.len(),
         job.node_only()
     ));
     let (store, prefix) = object_store_for(cfg, &meta.root)?;
     let mut work = Work::new(store, prefix);
+    progress(log, format!("temporary runs: {}", work.tmp));
     let result = async {
         let files = prepare(cfg, &meta, &selected, job, &mut work, log).await?;
         // Never delete published files if a lost COMMIT response makes the outcome uncertain.
         work.outputs.clear();
         let mut attempt = 1;
         let snapshot = loop {
+            progress(log, format!("publishing {} replacement files (attempt {attempt})", files.len()));
             match commit(&mut client, &meta, utc_col, &selected, job, &files).await {
                 Ok(snapshot) => break snapshot,
                 Err(e) if is_commit_conflict(&e) && attempt < MAX_COMMIT_ATTEMPTS => {
-                    log.push(format!("repack commit conflict (attempt {attempt}); retrying: {e:#}"));
+                    progress(log, format!("repack commit conflict (attempt {attempt}); retrying: {e:#}"));
                     tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64)).await;
                     attempt += 1;
                 }
                 Err(e) => {
-                    log.push(format!("commit failed; retaining candidate files {:?} under {} to avoid \
+                    progress(log, format!("commit failed; retaining candidate files {:?} under {} to avoid \
                         deleting files after an uncertain commit; unreferenced files may be cleaned up later",
                         files.iter().map(|f| &f.name).collect::<Vec<_>>(), meta.root));
                     return Err(e);
                 }
             }
         };
-        log.push(format!("committed compaction snapshot {snapshot}; retired {} files", selected.len()));
+        progress(log, format!("committed compaction snapshot {snapshot}; retired {} files in {:.1}s",
+            selected.len(), started.elapsed().as_secs_f64()));
         Ok(())
     }.await;
     work.cleanup(log).await;
+    progress(log, format!("cleanup complete; elapsed {:.1}s; success={}", started.elapsed().as_secs_f64(), result.is_ok()));
     result
 }
 
@@ -713,6 +777,82 @@ pub async fn run(cfg: &Config, job: &Job, log: &mut Vec<String>) -> Result<()> {
 mod tests {
     use super::*;
     use datafusion::arrow::array::{StringArray, TimestampMicrosecondArray};
+
+    #[tokio::test]
+    #[ignore = "requires configured Postgres catalog; reads ciso.rtprices without modifying data"]
+    async fn inlined_text_timestamps_accept_datetime_parameters() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let cfg = Config::from_env().unwrap();
+        let mut client = connect(&cfg).await.unwrap();
+        let tx = client.build_transaction().read_only(true).start().await.unwrap();
+        let meta = table_meta(&tx, "ciso", "rtprices").await.unwrap();
+        let count: i64 = tx.query_one(
+            "SELECT count(*) FROM ducklake.ducklake_inlined_data_tables WHERE table_id = $1",
+            &[&meta.table_id],
+        ).await.unwrap().get(0);
+        assert!(count > 0, "regression test requires an inlined data table");
+        let job = Job {
+            table: "ciso.rtprices".into(),
+            begin_date: "1900-01-01".parse().unwrap(),
+            end_date: "1900-01-02".parse().unwrap(),
+            unique: None,
+        };
+        check_inlined(&tx, meta.table_id, &job).await.unwrap();
+    }
+
+    #[test]
+    fn validates_optional_unique_columns() {
+        let base = serde_json::json!({
+            "table": "rtprices", "begin_date": "2026-01-01", "end_date": "2026-01-02"
+        });
+        let schema = crate::transform::target_schema();
+        for unique in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(["utcbegin", "node"])),
+        ] {
+            let mut payload = base.clone();
+            if let Some(unique) = unique {
+                payload["unique"] = unique;
+            }
+            let job: Job = serde_json::from_value(payload).unwrap();
+            job.validate().unwrap();
+            job.validate_schema(&schema).unwrap();
+        }
+        for unique in [
+            serde_json::json!([]),
+            serde_json::json!([""]),
+            serde_json::json!(["node", "node"]),
+            serde_json::json!(["missing"]),
+            serde_json::json!([ROW_ID]),
+        ] {
+            let mut payload = base.clone();
+            payload["unique"] = unique;
+            let job: Job = serde_json::from_value(payload).unwrap();
+            assert!(
+                job.validate()
+                    .and_then(|_| job.validate_schema(&schema))
+                    .is_err()
+            );
+        }
+        let mut payload = base;
+        payload["unique"] = serde_json::json!(["node"]);
+        let job: Job = serde_json::from_value(payload).unwrap();
+        let no_download = Arc::new(Schema::new(
+            schema
+                .fields()
+                .iter()
+                .filter(|f| f.name() != "downloaded_at")
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        assert!(job.validate_schema(&no_download).is_err());
+        let wrong_download = Arc::new(Schema::new(vec![
+            Field::new("node", DataType::Utf8, true),
+            Field::new("downloaded_at", DataType::Utf8, true),
+        ]));
+        assert!(job.validate_schema(&wrong_download).is_err());
+    }
 
     #[test]
     fn validates_dates_table_and_calendar_month_cutoff() {
@@ -733,6 +873,7 @@ mod tests {
                 table: table.into(),
                 begin_date: "2026-01-01".parse().unwrap(),
                 end_date: "2026-02-01".parse().unwrap(),
+                unique: None,
             };
             assert!(job.validate().is_err());
         }
@@ -785,6 +926,7 @@ mod tests {
                 table: "rtprices".into(),
                 begin_date: begin.parse().unwrap(),
                 end_date: end.parse().unwrap(),
+                unique: None,
             };
             job.validate().unwrap();
             let start = DateTime::parse_from_rfc3339(expected_start)
@@ -826,6 +968,7 @@ mod tests {
             table: "rtprices".into(),
             begin_date: "2026-03-01".parse().unwrap(),
             end_date: "2026-04-01".parse().unwrap(),
+            unique: None,
         };
         assert!(job.node_only());
         assert_eq!(
