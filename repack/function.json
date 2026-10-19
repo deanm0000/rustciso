@@ -1,0 +1,11 @@
+{
+  "bindings": [
+    {
+      "name": "repack",
+      "type": "queueTrigger",
+      "direction": "in",
+      "queueName": "repack",
+      "connection": "AzureWebJobsStorage"
+    }
+  ]
+}

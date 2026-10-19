@@ -1,0 +1,11 @@
+{
+  "bindings": [
+    {
+      "name": "rtprices",
+      "type": "queueTrigger",
+      "direction": "in",
+      "queueName": "rtprices",
+      "connection": "AzureWebJobsStorage"
+    }
+  ]
+}
