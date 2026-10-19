@@ -16,4 +16,5 @@ Enqueue messages on the `daprices` queue using the same format as
   operating day (DAM results normally post around 13:00).
 - Not-ready responses retry every 10 minutes.
 - Every day is both the first and last window of its date, so either repack
-  flag queues a repack of that day with `table: "ciso.daprices"`.
+  flag queues a repack of that day with `table: "ciso.daprices"` and
+  `unique: ["utcbegin", "node"]`.

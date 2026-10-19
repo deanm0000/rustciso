@@ -29,6 +29,8 @@ pub struct Job {
     pub end_date: NaiveDate,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<String>>,
 }
 
 impl Job {
@@ -551,6 +553,35 @@ async fn prepare(
     Ok(files)
 }
 
+async fn lock_table(client: &Client, job: &Job) -> Result<()> {
+    let (schema, table) = job.names();
+    let key = format!("rustciso.repack:{schema}.{table}");
+    // Session-scoped so sorting and all commit retries stay protected without
+    // holding an idle transaction. The owning connection releases it on exit.
+    client
+        .query_one("SELECT pg_advisory_lock(hashtextextended($1, 0))", &[&key])
+        .await
+        .context("acquiring repack advisory lock")?;
+    Ok(())
+}
+
+async fn has_current_files(c: &impl GenericClient, table_id: i64, job: &Job) -> Result<bool> {
+    let Some(files) = &job.files else {
+        return Ok(true);
+    };
+    Ok(c
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1 FROM ducklake.ducklake_data_file
+                 WHERE table_id = $1 AND end_snapshot IS NULL AND path = ANY($2)
+            )",
+            &[&table_id, files],
+        )
+        .await
+        .context("checking repack files in current snapshot")?
+        .try_get(0)?)
+}
+
 async fn check_inlined(c: &impl GenericClient, table_id: i64, job: &Job) -> Result<()> {
     if has_inlined_rows(c, table_id, job.start()?, job.end()?).await? {
         bail!("range contains inlined data; flush it to Parquet before repacking");
@@ -712,20 +743,28 @@ pub async fn run(cfg: &Config, job: &Job, log: &mut Vec<String>) -> Result<()> {
         "{} [{}, {}) UTC: connecting to catalog", job.table, job.start()?, job.end()?
     ));
     let mut client = connect(cfg).await?;
+    progress(log, format!("waiting for repack advisory lock on {}", job.table));
+    lock_table(&client, job).await?;
+    progress(log, format!("acquired repack advisory lock on {}", job.table));
     let (schema_name, table_name) = job.names();
     let meta = table_meta(&client, schema_name, table_name).await?;
-    let utc_col = meta
-        .columns
-        .get("utcbegin")
-        .context("table has no utcbegin column")?
-        .id;
-    job.validate_schema(&schema(&meta)?)?;
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
         .read_only(true)
         .start()
         .await?;
+    if !has_current_files(&tx, meta.table_id, job).await? {
+        tx.commit().await?;
+        progress(log, "none of the supplied files are current; skipping already completed repack".into());
+        return Ok(());
+    }
+    let utc_col = meta
+        .columns
+        .get("utcbegin")
+        .context("table has no utcbegin column")?
+        .id;
+    job.validate_schema(&schema(&meta)?)?;
     progress(log, format!("checking inlined rows and source files for table {}", meta.table_id));
     check_inlined(&tx, meta.table_id, job).await?;
     let selected = sources(&tx, meta.table_id, utc_col, job).await?;
@@ -778,6 +817,125 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{StringArray, TimestampMicrosecondArray};
 
+    #[test]
+    fn optional_files_roundtrip_preserves_existing_jobs() {
+        let base = serde_json::json!({
+            "table": "rtprices", "begin_date": "2026-01-01", "end_date": "2026-02-01"
+        });
+        let job: Job = serde_json::from_value(base.clone()).unwrap();
+        job.validate().unwrap();
+        assert!(job.files.is_none());
+        assert_eq!(serde_json::to_value(job).unwrap(), base);
+        for files in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!(["daily-1.parquet", "daily-2.parquet"]),
+        ] {
+            let mut payload = base.clone();
+            payload["files"] = files.clone();
+            let job: Job = serde_json::from_value(payload).unwrap();
+            job.validate().unwrap();
+            if files.is_null() {
+                assert!(job.files.is_none());
+            } else {
+                assert_eq!(serde_json::to_value(job).unwrap()["files"], files);
+            }
+        }
+        for files in [serde_json::json!("file.parquet"), serde_json::json!([42])] {
+            let mut payload = base.clone();
+            payload["files"] = files;
+            assert!(serde_json::from_value::<Job>(payload).is_err());
+        }
+    }
+
+    async fn test_database() -> (Client, tokio::task::JoinHandle<()>) {
+        let url = std::env::var("MAINTENANCE_TEST_DATABASE_URL").unwrap();
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        (client, tokio::spawn(async move { connection.await.unwrap() }))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MAINTENANCE_TEST_DATABASE_URL pointing to isolated test Postgres"]
+    async fn postgres_advisory_lock_serializes_aliases_and_overlapping_ranges() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (mut owner, owner_connection) = test_database().await;
+        let (waiter, waiter_connection) = test_database().await;
+        let (other, other_connection) = test_database().await;
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "table": "rtprices", "begin_date": "2026-01-01", "end_date": "2026-02-01"
+        })).unwrap();
+        lock_table(&owner, &job).await.unwrap();
+        let alias: Job = serde_json::from_value(serde_json::json!({
+            "table": "ciso.rtprices", "begin_date": "2026-01-15", "end_date": "2026-02-15"
+        })).unwrap();
+        let mut waiting = tokio::spawn(async move {
+            lock_table(&waiter, &alias).await.unwrap();
+            waiter
+        });
+        assert!(timeout(Duration::from_millis(100), &mut waiting).await.is_err());
+        // A commit must not release the lock while sorting or between retries.
+        owner.transaction().await.unwrap().commit().await.unwrap();
+        assert!(timeout(Duration::from_millis(100), &mut waiting).await.is_err());
+        let other_job: Job = serde_json::from_value(serde_json::json!({
+            "table": "ciso.fmprices", "begin_date": "2026-01-01", "end_date": "2026-02-01"
+        })).unwrap();
+        timeout(Duration::from_secs(5), lock_table(&other, &other_job)).await.unwrap().unwrap();
+        drop(other);
+        other_connection.await.unwrap();
+        // Early returns/errors drop the owning client just like normal completion.
+        drop(owner);
+        owner_connection.await.unwrap();
+        let waiter = timeout(Duration::from_secs(5), waiting).await.unwrap().unwrap();
+        drop(waiter);
+        waiter_connection.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MAINTENANCE_TEST_DATABASE_URL pointing to a test Postgres without a ducklake schema"]
+    async fn postgres_file_guard_checks_any_current_path_in_the_target_table() {
+        let (mut client, connection) = test_database().await;
+        let tx = client.transaction().await.unwrap();
+        tx.batch_execute("
+            CREATE SCHEMA ducklake;
+            CREATE TABLE ducklake.ducklake_data_file (
+                table_id bigint, path text, end_snapshot bigint
+            );
+            INSERT INTO ducklake.ducklake_data_file VALUES
+                (1, 'daily-1.parquet', NULL),
+                (1, 'daily-2.parquet', 10),
+                (1, 'monthly.parquet', NULL),
+                (2, 'other-table.parquet', NULL);
+        ").await.unwrap();
+        let mut job: Job = serde_json::from_value(serde_json::json!({
+            "table": "rtprices", "begin_date": "2026-01-01", "end_date": "2026-02-01"
+        })).unwrap();
+        for (files, expected) in [
+            (None, true),
+            (Some(vec![]), false),
+            (Some(vec!["missing.parquet"]), false),
+            (Some(vec!["daily-2.parquet"]), false),
+            (Some(vec!["other-table.parquet"]), false),
+            (Some(vec!["daily-1.parquet"]), true),
+            (Some(vec!["daily-2.parquet", "daily-1.parquet"]), true),
+        ] {
+            job.files = files.map(|paths| paths.into_iter().map(String::from).collect());
+            assert_eq!(has_current_files(&tx, 1, &job).await.unwrap(), expected);
+        }
+        tx.execute(
+            "UPDATE ducklake.ducklake_data_file SET end_snapshot = 11
+              WHERE table_id = 1 AND path = 'daily-1.parquet'",
+            &[],
+        ).await.unwrap();
+        assert!(!has_current_files(&tx, 1, &job).await.unwrap());
+        tx.rollback().await.unwrap();
+        drop(client);
+        connection.await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires configured Postgres catalog; reads ciso.rtprices without modifying data"]
     async fn inlined_text_timestamps_accept_datetime_parameters() {
@@ -796,6 +954,7 @@ mod tests {
             begin_date: "1900-01-01".parse().unwrap(),
             end_date: "1900-01-02".parse().unwrap(),
             unique: None,
+            files: None,
         };
         check_inlined(&tx, meta.table_id, &job).await.unwrap();
     }
@@ -874,6 +1033,7 @@ mod tests {
                 begin_date: "2026-01-01".parse().unwrap(),
                 end_date: "2026-02-01".parse().unwrap(),
                 unique: None,
+                files: None,
             };
             assert!(job.validate().is_err());
         }
@@ -927,6 +1087,7 @@ mod tests {
                 begin_date: begin.parse().unwrap(),
                 end_date: end.parse().unwrap(),
                 unique: None,
+                files: None,
             };
             job.validate().unwrap();
             let start = DateTime::parse_from_rfc3339(expected_start)
@@ -969,6 +1130,7 @@ mod tests {
             begin_date: "2026-03-01".parse().unwrap(),
             end_date: "2026-04-01".parse().unwrap(),
             unique: None,
+            files: None,
         };
         assert!(job.node_only());
         assert_eq!(

@@ -26,6 +26,7 @@ use tokio_postgres::{Client, GenericClient, IsolationLevel};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
+pub mod maintenance;
 pub mod repack;
 
 pub const SCHEMA: &str = "ciso";

@@ -48,10 +48,11 @@ is retried through the usual failure path. Other OASIS errors are unchanged.
 If `repack_if_first` is true and the loaded hour is the first hour of its
 `America/Los_Angeles` date, or `repack_if_last` is true and it is the last hour,
 one message is sent immediately to the [repack queue](../repack/README.md).
-It contains `table: "ciso.rtprices"` and the half-open local-date interval
-`[that date, the next date)`. Daylight-saving days with 23 or 25 hours are
-handled using local date boundaries. A first-hour repack does not wait for
-the rest of that day's hours to load; it repacks the data currently available.
+It contains `table: "ciso.rtprices"`, the half-open local-date interval
+`[that date, the next date)`, and `unique: ["utcbegin", "node"]`.
+Daylight-saving days with 23 or 25 hours are handled using local date
+boundaries. A first-hour repack does not wait for the rest of that day's hours
+to load; it repacks the data currently available.
 
 Queue-send failures fail the invocation so the Functions host retries it.
 Sends to multiple queues are not atomic, so host retries can duplicate

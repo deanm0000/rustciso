@@ -89,6 +89,26 @@ async fn repack_handler(
     }
 }
 
+async fn maintenance_handler(
+    State(state): State<Arc<AppState>>,
+    req: Result<Json<FuncRequest>, JsonRejection>,
+) -> HandlerResponse {
+    if let Err(e) = req {
+        return respond(
+            StatusCode::BAD_REQUEST,
+            vec![format!("bad maintenance request: {e}")],
+        );
+    }
+    let mut log = vec!["starting table maintenance".to_string()];
+    match lake::maintenance::run(&state.cfg, &state.repack_queue, &mut log).await {
+        Ok(()) => respond(StatusCode::OK, log),
+        Err(e) => {
+            log.push(format!("maintenance failed: {e:#}"));
+            respond(StatusCode::INTERNAL_SERVER_ERROR, log)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -113,7 +133,9 @@ async fn main() -> Result<()> {
         repack_queue,
     });
 
-    let mut app = Router::new().route("/repack", post(repack_handler));
+    let mut app = Router::new()
+        .route("/repack", post(repack_handler))
+        .route("/maintenance", post(maintenance_handler));
     for market in MARKETS {
         app = app.route(&format!("/{}", market.name), prices::route(market));
     }

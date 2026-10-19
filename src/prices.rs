@@ -72,7 +72,8 @@ impl Job {
                 table: market.table(),
                 begin_date: date,
                 end_date: date.succ_opt().context("repack end date is out of range")?,
-                unique: None,
+                unique: Some(vec!["utcbegin".into(), "node".into()]),
+                files: None,
             }))
         } else {
             Ok(None)
@@ -437,6 +438,7 @@ mod tests {
                                         "table": market.table(),
                                         "begin_date": start.with_timezone(&Los_Angeles).date_naive().to_string(),
                                         "end_date": end.with_timezone(&Los_Angeles).date_naive().to_string(),
+                                        "unique": ["utcbegin", "node"],
                                     })
                                 );
                                 let decoded: lake::repack::Job =

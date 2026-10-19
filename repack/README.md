@@ -27,6 +27,22 @@ Null key values compare equal. The list must be nonempty, contain distinct
 existing columns, and the table must have microsecond `timestamptz downloaded_at`.
 Omit `unique` or set it to `null` to preserve all rows without deduplication.
 
+`files` is an optional list of **catalog paths**, exactly as stored in
+`ducklake.ducklake_data_file.path` (not resolved blob URLs). For example:
+
+```json
+"files": ["daily-01.parquet", "daily-02.parquet"]
+```
+
+After acquiring the advisory lock, the worker checks the current snapshot for
+these paths in the requested table. If **any** are still active
+(`end_snapshot IS NULL`), the repack proceeds normally. If none remain, it
+logs a successful skip, assuming an earlier repack already handled the work.
+An empty list also skips. Omit `files` or set it to `null` to bypass this guard,
+preserving existing manually queued and price-triggered jobs. The list is a
+freshness guard, not a filter: all current files overlapping the date range
+are still selected for repacking.
+
 ## Output layout
 
 - One nonempty Parquet file contains all live rows in the requested interval,
@@ -56,6 +72,10 @@ The [hourly RT prices trigger](../rtprices/README.md) can also enqueue a
 single-day repack after successfully processing the first or last Los Angeles
 hour of that day, using its `repack_if_first` and `repack_if_last` flags.
 
+The [table maintenance timer](../maintenance/README.md) checks all three price
+tables every 30 minutes and enqueues eligible month-grouped ranges with
+`unique: ["utcbegin", "node"]` and the discovered `files` list.
+
 ## Azure runtime and failure behavior
 
 Sorting uses approximately 64 MiB input runs and eight-way streaming merge
@@ -73,6 +93,18 @@ The app's `functionTimeout` is `-1`, which **requires an Azure Functions hosting
 plan supporting unbounded execution**. Azure platform restarts and scale-in can
 still interrupt an invocation. This setting applies to the whole Function App.
 No durable continuation/checkpoint is implemented; a retry starts sorting again.
+Jobs carrying `files` skip retries when their original files are no longer active.
+
+Every repack acquires a blocking, session-scoped Postgres advisory lock before
+reading the catalog. Locks are keyed by the normalized schema/table name
+(`rtprices` and `ciso.rtprices` share a lock), so all repacks of a table are
+serialized, including overlapping but nonidentical ranges. Different tables
+can run concurrently. The same connection holds the lock through sorting,
+commit retries and cleanup, without keeping a transaction open during sorting.
+Normal returns, errors and disconnects release the lock when that connection
+closes. Waiting jobs check `files` only after acquiring the lock.
+These locks coordinate repack workers, not ordinary ingestion writers;
+existing commit-time source/schema validation remains in place.
 
 Progress is written immediately to the handler console, rather than waiting for
 the invocation response: catalog checks, each source file, sorted runs, merge
@@ -119,6 +151,14 @@ also verifies timestamp parameters against real inlined tables:
 
 ```sh
 cargo test inlined_text_timestamps_accept_datetime_parameters -- --ignored
+```
+
+With an isolated test Postgres database without a `ducklake` schema, the
+advisory-lock and file-guard regressions can be run without live catalog access:
+
+```sh
+MAINTENANCE_TEST_DATABASE_URL='postgresql://postgres@localhost:5432/testdb' \
+  cargo test lake::repack::tests::postgres_ -- --ignored
 ```
 
 Tests use an in-memory object store with the same range-read and multipart
