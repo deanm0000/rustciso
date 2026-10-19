@@ -1,5 +1,8 @@
 # Hourly RT prices queue trigger
 
+See also [fmprices](../fmprices/README.md) and [daprices](../daprices/README.md),
+which share this implementation (`src/prices.rs`, configured in `src/market.rs`).
+
 Enqueue a base64-encoded JSON message on the `rtprices` Azure Storage queue
 (`AzureWebJobsStorage`):
 
@@ -57,5 +60,5 @@ continuations or repack requests that were already sent.
 ## Local verification
 
 ```sh
-cargo test --bin rustciso tests:: -- --skip lake::
+cargo test --bin rustciso -- --skip lake::
 ```

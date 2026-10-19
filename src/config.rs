@@ -19,7 +19,7 @@ pub struct Config {
     pub postgres: tokio_postgres::Config,
     /// Account holding the DuckLake parquet files (`Synblob`).
     pub lake_account: StorageAccount,
-    /// Account holding the `rtprices` and `repack` queues (`AzureWebJobsStorage`).
+    /// Account holding the price (`rtprices`, `fmprices`, `daprices`) and `repack` queues (`AzureWebJobsStorage`).
     pub queue_account: StorageAccount,
 }
 

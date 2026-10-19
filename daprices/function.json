@@ -1,0 +1,11 @@
+{
+  "bindings": [
+    {
+      "name": "daprices",
+      "type": "queueTrigger",
+      "direction": "in",
+      "queueName": "daprices",
+      "connection": "AzureWebJobsStorage"
+    }
+  ]
+}

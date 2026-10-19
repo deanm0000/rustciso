@@ -1,13 +1,11 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use std::io::{Cursor, Read};
 
 const OASIS_URL: &str = "https://oasis.caiso.com/oasisapi/SingleZip";
 const OASIS_FMT: &str = "%Y%m%dT%H:%M%z";
-/// Each OASIS RTM interval query returns at most one hour.
-pub const WINDOW: Duration = Duration::hours(1);
 const RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_millis(5100);
 const RATE_LIMIT_RETRIES: usize = 2;
 /// OASIS error code for "No data returned for the specified selection".
@@ -37,24 +35,43 @@ pub fn format_oasis_time(t: DateTime<Utc>) -> String {
     t.format("%Y%m%dT%H:%M-0000").to_string()
 }
 
-pub fn build_url(start: DateTime<Utc>) -> String {
+/// The OASIS SingleZip parameters that vary between price reports.
+#[derive(Debug, Clone, Copy)]
+pub struct OasisQuery {
+    pub queryname: &'static str,
+    pub version: &'static str,
+    pub market_run_id: &'static str,
+    pub grp_type: &'static str,
+}
+
+pub fn build_url(query: &OasisQuery, start: DateTime<Utc>, end: DateTime<Utc>) -> String {
     format!(
-        "{OASIS_URL}?resultformat=6&queryname=PRC_INTVL_LMP&version=3&startdatetime={}&enddatetime={}&market_run_id=RTM&grp_type=ALL",
+        "{OASIS_URL}?resultformat=6&queryname={}&version={}&startdatetime={}&enddatetime={}&market_run_id={}&grp_type={}",
+        query.queryname,
+        query.version,
         format_oasis_time(start),
-        format_oasis_time(start + WINDOW),
+        format_oasis_time(end),
+        query.market_run_id,
+        query.grp_type,
     )
 }
 
 #[derive(Debug)]
 pub enum OasisResult {
-    /// Raw CSV file contents, one per LMP type.
+    /// Raw CSV file contents (one per LMP type for some reports, one combined file for others).
     Csvs(Vec<(String, Bytes)>),
     /// OASIS has no data for the window yet.
     NotReady(String),
 }
 
-pub async fn fetch(client: &reqwest::Client, start: DateTime<Utc>, log: &mut Vec<String>) -> Result<OasisResult> {
-    let url = build_url(start);
+pub async fn fetch(
+    client: &reqwest::Client,
+    query: &OasisQuery,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    log: &mut Vec<String>,
+) -> Result<OasisResult> {
+    let url = build_url(query, start, end);
     fetch_url(client, &url, log).await
 }
 
@@ -206,8 +223,12 @@ mod tests {
     fn time_roundtrip_and_url() {
         let t = parse_oasis_time("20261016T07:00-0000").unwrap();
         assert_eq!(format_oasis_time(t), "20261016T07:00-0000");
-        let url = build_url(t);
-        assert!(url.contains("startdatetime=20261016T07:00-0000&enddatetime=20261016T08:00-0000"));
+        let end = parse_oasis_time("20261017T07:00-0000").unwrap();
+        let url = build_url(&crate::market::DAPRICES.query, t, end);
+        assert_eq!(
+            url,
+            "https://oasis.caiso.com/oasisapi/SingleZip?resultformat=6&queryname=PRC_LMP&version=12&startdatetime=20261016T07:00-0000&enddatetime=20261017T07:00-0000&market_run_id=DAM&grp_type=ALL_APNODES"
+        );
     }
 
     #[test]

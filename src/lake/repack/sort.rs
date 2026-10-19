@@ -493,7 +493,7 @@ mod tests {
         for node_only in [false, true] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let mut work = Work::new(store.clone(), "table/".into());
-            let input_schema = crate::transform::target_schema();
+            let input_schema = crate::transform::target_schema("rt");
             let meta = TableMeta {
                 table_id: 1,
                 root: String::new(),
@@ -653,7 +653,7 @@ mod tests {
             let unique: Vec<String> = unique.into_iter().map(String::from).collect();
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let mut work = Work::new(store.clone(), "table/".into());
-            let input = crate::transform::target_schema();
+            let input = crate::transform::target_schema("rt");
             let meta = TableMeta {
                 table_id: 1,
                 root: String::new(),

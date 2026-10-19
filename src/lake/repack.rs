@@ -805,7 +805,7 @@ mod tests {
         let base = serde_json::json!({
             "table": "rtprices", "begin_date": "2026-01-01", "end_date": "2026-01-02"
         });
-        let schema = crate::transform::target_schema();
+        let schema = crate::transform::target_schema("rt");
         for unique in [
             None,
             Some(serde_json::Value::Null),

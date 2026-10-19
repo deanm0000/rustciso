@@ -29,8 +29,6 @@ use uuid::Uuid;
 pub mod repack;
 
 pub const SCHEMA: &str = "ciso";
-pub const TABLE_NAME: &str = "rtprices";
-pub const TABLE: &str = "ciso.rtprices";
 const AUTHOR: &str = "rustciso";
 const MAX_COMMIT_ATTEMPTS: u32 = 6;
 
@@ -429,6 +427,7 @@ enum Attempt {
 
 async fn try_register(
     client: &mut Client,
+    table: &str,
     meta: &TableMeta,
     utc_col: i64,
     start: DateTime<Utc>,
@@ -501,7 +500,7 @@ async fn try_register(
     if !retire.is_empty() {
         changes.push_str(&format!(",deleted_from_table:{table_id}"));
     }
-    let message = format!("{TABLE} {}", start.format("%Y-%m-%dT%H:%MZ"));
+    let message = format!("{SCHEMA}.{table} {}", start.format("%Y-%m-%dT%H:%MZ"));
     tx.execute(
         "INSERT INTO ducklake.ducklake_snapshot_changes
            (snapshot_id, changes_made, author, commit_message, commit_extra_info)
@@ -684,9 +683,9 @@ fn is_commit_conflict(e: &anyhow::Error) -> bool {
 }
 
 /// Fallback for windows whose rows share files with other hours: let pg_ducklake delete them.
-async fn sql_delete(client: &Client, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<u64> {
+async fn sql_delete(client: &Client, table: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<u64> {
     let sql = format!(
-        "DELETE FROM {SCHEMA}.{TABLE_NAME} WHERE utcbegin >= '{}' AND utcbegin < '{}'",
+        "DELETE FROM {SCHEMA}.{table} WHERE utcbegin >= '{}' AND utcbegin < '{}'",
         start.to_rfc3339(),
         end.to_rfc3339()
     );
@@ -696,9 +695,10 @@ async fn sql_delete(client: &Client, start: DateTime<Utc>, end: DateTime<Utc>) -
         .context("pg_ducklake DELETE for window")
 }
 
-/// Replace the rows of `ciso.rtprices` in `[start, end)` with `batches` as one new snapshot.
+/// Replace the rows of `SCHEMA.table` in `[start, end)` with `batches` as one new snapshot.
 pub async fn replace_window(
     cfg: &Config,
+    table: &str,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     batches: Vec<RecordBatch>,
@@ -708,7 +708,7 @@ pub async fn replace_window(
         bail!("no rows to load for {start}");
     }
     let mut client = connect(cfg).await?;
-    let meta = table_meta(&client, SCHEMA, TABLE_NAME).await?;
+    let meta = table_meta(&client, SCHEMA, table).await?;
     let cols = resolve_columns(&meta, &batches[0].schema())?;
     let utc_col = meta
         .columns
@@ -727,7 +727,7 @@ pub async fn replace_window(
         .await
         .with_context(|| format!("uploading {}{}", meta.root, file.name))?;
 
-    let result = register(&mut client, &meta, utc_col, start, end, &file).await;
+    let result = register(&mut client, table, &meta, utc_col, start, end, &file).await;
     if result.is_err() {
         if let Err(e) = store.delete(&obj).await {
             eprintln!("could not remove orphaned {obj}: {e}");
@@ -738,6 +738,7 @@ pub async fn replace_window(
 
 async fn register(
     client: &mut Client,
+    table: &str,
     meta: &TableMeta,
     utc_col: i64,
     start: DateTime<Utc>,
@@ -746,7 +747,7 @@ async fn register(
 ) -> Result<LoadReport> {
     let mut sql_deleted = None;
     for attempt in 1..=MAX_COMMIT_ATTEMPTS {
-        match try_register(client, meta, utc_col, start, end, file).await {
+        match try_register(client, table, meta, utc_col, start, end, file).await {
             Ok(Attempt::Done(mut report)) => {
                 report.sql_deleted = sql_deleted;
                 return Ok(report);
@@ -755,7 +756,7 @@ async fn register(
                 if sql_deleted.is_some() {
                     bail!("rows for {start} still present after pg_ducklake DELETE");
                 }
-                sql_deleted = Some(sql_delete(client, start, end).await?);
+                sql_deleted = Some(sql_delete(client, table, start, end).await?);
             }
             Err(e) if is_commit_conflict(&e) && attempt < MAX_COMMIT_ATTEMPTS => {
                 eprintln!("ducklake commit conflict (attempt {attempt}), retrying: {e:#}");
