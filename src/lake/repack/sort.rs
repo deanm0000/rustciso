@@ -22,7 +22,6 @@ use futures::{FutureExt, TryStreamExt};
 use object_store::buffered::BufWriter;
 use std::ops::Range;
 
-const RUN_BYTES: usize = 64 * 1024 * 1024;
 const MERGE_FAN_IN: usize = 8;
 const TARGET_ROWS: usize = 1_048_576;
 const TARGET_BYTES: usize = 128 * 1024 * 1024;
@@ -41,6 +40,19 @@ impl AsyncFileReader for BlobReader {
         async move {
             self.store
                 .get_range(&self.path, range)
+                .await
+                .map_err(parquet_error)
+        }
+        .boxed()
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
+        async move {
+            self.store
+                .get_ranges(&self.path, &ranges)
                 .await
                 .map_err(parquet_error)
         }
@@ -67,7 +79,12 @@ impl MetadataSuffixFetch for &mut BlobReader {
     fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, ParquetResult<Bytes>> {
         async move {
             // Azure rejects suffix ranges; resolve the footer against the blob size.
-            let size = self.store.head(&self.path).await.map_err(parquet_error)?.size;
+            let size = self
+                .store
+                .head(&self.path)
+                .await
+                .map_err(parquet_error)?
+                .size;
             self.store
                 .get_range(&self.path, size.saturating_sub(suffix as u64)..size)
                 .await
@@ -87,6 +104,137 @@ pub(super) async fn reader(
             .with_batch_size(8192)
             .build()?,
     )
+}
+
+#[derive(Clone)]
+pub(super) struct RowGroupBounds {
+    pub min: String,
+    pub max: String,
+    pub bytes: usize,
+}
+
+pub(super) struct RowGroupFile {
+    stream: datafusion::parquet::arrow::async_reader::ParquetRecordBatchStream<BlobReader>,
+    schema: SchemaRef,
+    bounds: Vec<RowGroupBounds>,
+    index: usize,
+}
+
+pub(super) enum RowGroupOpen {
+    Eligible(RowGroupFile),
+    Ineligible(String),
+}
+
+impl RowGroupFile {
+    pub(super) async fn open(
+        store: Arc<dyn ObjectStore>,
+        path: ObjPath,
+        row_group_col: &str,
+    ) -> Result<RowGroupOpen> {
+        let builder = ParquetRecordBatchStreamBuilder::new(BlobReader { store, path }).await?;
+        let schema = builder.schema().clone();
+        let node_index = match schema.index_of(row_group_col) {
+            Ok(index) => index,
+            Err(_) => {
+                return Ok(RowGroupOpen::Ineligible(format!(
+                    "column {row_group_col:?} is missing"
+                )));
+            }
+        };
+        if schema.field(node_index).data_type() != &DataType::Utf8
+            || builder.parquet_schema().num_columns() != schema.fields().len()
+        {
+            return Ok(RowGroupOpen::Ineligible(format!(
+                "column {row_group_col:?} is not a plain UTF-8 column"
+            )));
+        }
+        let metadata = builder.metadata();
+        let mut bounds = Vec::with_capacity(metadata.num_row_groups());
+        for (index, row_group) in metadata.row_groups().iter().enumerate() {
+            let column = row_group.column(node_index);
+            let Some(stats) = column.statistics() else {
+                return Ok(RowGroupOpen::Ineligible(format!(
+                    "row group {index} has no {row_group_col:?} statistics"
+                )));
+            };
+            let (Some(min), Some(max)) = (stats.min_bytes_opt(), stats.max_bytes_opt()) else {
+                return Ok(RowGroupOpen::Ineligible(format!(
+                    "row group {index} has incomplete {row_group_col:?} min/max statistics"
+                )));
+            };
+            if stats.null_count_opt() != Some(0) || !stats.min_is_exact() || !stats.max_is_exact() {
+                return Ok(RowGroupOpen::Ineligible(format!(
+                    "row group {index} has null or inexact {row_group_col:?} statistics"
+                )));
+            }
+            let (Ok(min), Ok(max)) = (std::str::from_utf8(min), std::str::from_utf8(max)) else {
+                return Ok(RowGroupOpen::Ineligible(format!(
+                    "row group {index} has non-UTF-8 {row_group_col:?} statistics"
+                )));
+            };
+            if min > max {
+                return Ok(RowGroupOpen::Ineligible(format!(
+                    "row group {index} has min greater than max"
+                )));
+            }
+            if bounds
+                .last()
+                .is_some_and(|previous: &RowGroupBounds| previous.max.as_str() > min)
+            {
+                return Ok(RowGroupOpen::Ineligible(format!(
+                    "row group {index} overlaps or precedes the previous group"
+                )));
+            }
+            let Ok(bytes) = usize::try_from(row_group.total_byte_size()) else {
+                return Ok(RowGroupOpen::Ineligible(format!(
+                    "row group {index} has an invalid uncompressed size"
+                )));
+            };
+            bounds.push(RowGroupBounds {
+                min: min.into(),
+                max: max.into(),
+                bytes,
+            });
+        }
+        let stream = builder.with_batch_size(8192).build()?;
+        Ok(RowGroupOpen::Eligible(Self {
+            stream,
+            schema,
+            bounds,
+            index: 0,
+        }))
+    }
+
+    pub(super) fn next_bounds(&self) -> Option<&RowGroupBounds> {
+        self.bounds.get(self.index)
+    }
+
+    pub(super) fn last_index(&self) -> usize {
+        self.index.saturating_sub(1)
+    }
+
+    pub(super) fn group_count(&self) -> usize {
+        self.bounds.len()
+    }
+
+    pub(super) fn groups_read(&self) -> usize {
+        self.index
+    }
+
+    pub(super) async fn next_group(&mut self) -> Result<Option<(RowGroupBounds, RecordBatch)>> {
+        let Some(bounds) = self.bounds.get(self.index).cloned() else {
+            return Ok(None);
+        };
+        let reader = self
+            .stream
+            .next_row_group()
+            .await?
+            .context("Parquet row-group stream ended before metadata")?;
+        let batches = reader.collect::<std::result::Result<Vec<_>, _>>()?;
+        let batch = concat_batches(&self.schema, &batches)?;
+        self.index += 1;
+        Ok(Some((bounds, batch)))
+    }
 }
 
 fn properties(manual_groups: bool) -> Result<WriterProperties> {
@@ -146,7 +294,7 @@ impl Runs {
         }
         self.bytes += batch.get_array_memory_size();
         self.batches.push(batch);
-        if self.bytes >= RUN_BYTES {
+        if self.bytes >= work.run_bytes {
             self.flush(work).await?;
         }
         Ok(())
@@ -157,31 +305,13 @@ impl Runs {
             return Ok(());
         }
         let batch = concat_batches(&self.batches[0].schema(), &self.batches)?;
-        let keys = self
-            .ordering
-            .iter()
-            .map(|(name, descending)| {
-                Ok(SortColumn {
-                    values: batch.column(batch.schema().index_of(name)?).clone(),
-                    options: Some(SortOptions {
-                        descending: *descending,
-                        nulls_first: false,
-                    }),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let indices = lexsort_to_indices(&keys, None)?;
-        let sorted = RecordBatch::try_new(
-            batch.schema(),
-            batch
-                .columns()
-                .iter()
-                .map(|a| take(a.as_ref(), &indices, None))
-                .collect::<std::result::Result<_, _>>()?,
-        )?;
+        let sorted = sort_batch(&batch, &self.ordering)?;
         let path = work.temp_path();
-        eprintln!("repack: writing sorted run {path}: {} rows, {} buffered bytes",
-            sorted.num_rows(), self.bytes);
+        eprintln!(
+            "repack: writing sorted run {path}: {} rows, {} buffered bytes",
+            sorted.num_rows(),
+            self.bytes
+        );
         let mut writer = AsyncArrowWriter::try_new(
             BufWriter::new(work.store.clone(), path.clone()),
             sorted.schema(),
@@ -214,8 +344,12 @@ impl Runs {
             return Ok(None);
         }
         let stream = self.stream(work).await?;
-        eprintln!("repack: writing final output from {} runs; row-group column={:?}; single-value-groups={node_only}; temporary prefix={}",
-            self.paths.len(), self.report.row_group_col, work.tmp);
+        eprintln!(
+            "repack: writing final output from {} runs; row-group column={:?}; single-value-groups={node_only}; temporary prefix={}",
+            self.paths.len(),
+            self.report.row_group_col,
+            work.tmp
+        );
         let file = write_output(work, stream, node_only, cols, self.report.row_group_col).await?;
         for path in &self.paths {
             work.remove_temp(path).await?;
@@ -282,8 +416,11 @@ impl Runs {
     async fn stream(&mut self, work: &mut Work) -> Result<SendableRecordBatchStream> {
         self.flush(work).await?;
         while self.paths.len() > MERGE_FAN_IN {
-            eprintln!("repack: merging {} runs with fan-in {MERGE_FAN_IN} under {}",
-                self.paths.len(), work.tmp);
+            eprintln!(
+                "repack: merging {} runs with fan-in {MERGE_FAN_IN} under {}",
+                self.paths.len(),
+                work.tmp
+            );
             let mut next = Vec::new();
             for chunk in self.paths.chunks(MERGE_FAN_IN) {
                 let mut stream = merged(work.store.clone(), chunk, &self.ordering).await?;
@@ -306,6 +443,74 @@ impl Runs {
         }
         merged(work.store.clone(), &self.paths, &self.ordering).await
     }
+}
+
+pub(super) fn sort_batch(batch: &RecordBatch, ordering: &[(String, bool)]) -> Result<RecordBatch> {
+    let keys = ordering
+        .iter()
+        .map(|(name, descending)| {
+            Ok(SortColumn {
+                values: batch.column(batch.schema().index_of(name)?).clone(),
+                options: Some(SortOptions {
+                    descending: *descending,
+                    nulls_first: false,
+                }),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let indices = lexsort_to_indices(&keys, None)?;
+    Ok(RecordBatch::try_new(
+        batch.schema(),
+        batch
+            .columns()
+            .iter()
+            .map(|array| take(array.as_ref(), &indices, None))
+            .collect::<std::result::Result<_, _>>()?,
+    )?)
+}
+
+pub(super) fn deduplicate_batch(
+    batch: &RecordBatch,
+    unique: &[String],
+) -> Result<(RecordBatch, i64)> {
+    let schema = batch.schema();
+    let mut ordering: Vec<_> = unique.iter().map(|name| (name.clone(), false)).collect();
+    ordering.push(("downloaded_at".into(), true));
+    ordering.push((ROW_ID.into(), true));
+    let sorted = sort_batch(batch, &ordering)?;
+    let indices = unique
+        .iter()
+        .map(|name| schema.index_of(name))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let converter = RowConverter::new(
+        indices
+            .iter()
+            .map(|index| SortField::new(schema.field(*index).data_type().clone()))
+            .collect(),
+    )?;
+    let keys = converter.convert_columns(
+        &indices
+            .iter()
+            .map(|index| sorted.column(*index).clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let mut previous: Option<OwnedRow> = None;
+    let mut removed = 0i64;
+    let keep = BooleanArray::from(
+        (0..sorted.num_rows())
+            .map(|index| {
+                let row = keys.row(index);
+                if previous.as_ref().is_some_and(|last| last.row() == row) {
+                    removed += 1;
+                    false
+                } else {
+                    previous = Some(row.owned());
+                    true
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    Ok((filter_record_batch(&sorted, &keep)?, removed))
 }
 
 async fn merged(
@@ -377,53 +582,81 @@ impl Groups {
     }
 }
 
-async fn write_output(
-    work: &mut Work,
-    mut stream: SendableRecordBatchStream,
-    node_only: bool,
-    cols: &[&Column],
-    row_group_col: Option<&str>,
-) -> Result<FileInfo> {
-    let name = format!("ducklake-{}.parquet", Uuid::now_v7());
-    let path = ObjPath::from(format!("{}{name}", work.prefix));
-    work.outputs.push(path.clone());
-    let schema = stream.schema();
-    let node_idx = row_group_col.map(|name| schema.index_of(name)).transpose()?;
-    if let Some(index) = node_idx
-        && schema.field(index).data_type() != &DataType::Utf8
-    {
-        bail!("row-group column must be varchar");
-    }
-    let mut writer = AsyncArrowWriter::try_new_with_options(
-        BufWriter::new(work.store.clone(), path.clone()),
-        schema.clone(),
-        ArrowWriterOptions::new()
-            .with_properties(properties(true)?)
-            .with_skip_arrow_metadata(true),
-    )?;
-    let mut stats: Vec<ColStats> = cols
-        .iter()
-        .map(|c| ColStats {
-            column_id: c.id,
-            ty: c.ty.clone(),
-            size_bytes: 0,
-            value_count: 0,
-            null_count: 0,
-            min: None,
-            max: None,
-            contains_nan: if c.ty == "float64" { Some(false) } else { None },
+pub(super) struct OutputWriter {
+    writer: AsyncArrowWriter<BufWriter>,
+    store: Arc<dyn ObjectStore>,
+    path: ObjPath,
+    name: String,
+    schema: SchemaRef,
+    node_idx: Option<usize>,
+    stats: Vec<ColStats>,
+    rows: i64,
+    groups: Groups,
+}
+
+impl OutputWriter {
+    pub(super) fn new(
+        work: &mut Work,
+        schema: SchemaRef,
+        node_only: bool,
+        cols: &[&Column],
+        row_group_col: Option<&str>,
+    ) -> Result<Self> {
+        let name = format!("ducklake-{}.parquet", Uuid::now_v7());
+        let path = ObjPath::from(format!("{}{name}", work.prefix));
+        work.outputs.push(path.clone());
+        let node_idx = row_group_col
+            .map(|name| schema.index_of(name))
+            .transpose()?;
+        if let Some(index) = node_idx
+            && schema.field(index).data_type() != &DataType::Utf8
+        {
+            bail!("row-group column must be varchar");
+        }
+        let writer = AsyncArrowWriter::try_new_with_options(
+            BufWriter::new(work.store.clone(), path.clone()),
+            schema.clone(),
+            ArrowWriterOptions::new()
+                .with_properties(properties(true)?)
+                .with_skip_arrow_metadata(true),
+        )?;
+        let stats = cols
+            .iter()
+            .map(|c| ColStats {
+                column_id: c.id,
+                ty: c.ty.clone(),
+                size_bytes: 0,
+                value_count: 0,
+                null_count: 0,
+                min: None,
+                max: None,
+                contains_nan: if c.ty == "float64" { Some(false) } else { None },
+            })
+            .collect();
+        Ok(Self {
+            writer,
+            store: work.store.clone(),
+            path,
+            name,
+            schema,
+            node_idx,
+            stats,
+            rows: 0,
+            groups: Groups {
+                node_only,
+                last_node: None,
+                rows: 0,
+                bytes: 0,
+            },
         })
-        .collect();
-    let mut rows = 0i64;
-    let mut groups = Groups {
-        node_only,
-        last_node: None,
-        rows: 0,
-        bytes: 0,
-    };
-    while let Some(batch) = stream.try_next().await? {
-        for (i, stat) in stats.iter_mut().enumerate() {
-            let (lo, hi, nan) = column_bounds(std::slice::from_ref(&batch), i)?;
+    }
+
+    pub(super) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        if batch.schema() != self.schema {
+            bail!("output batch schema changed while writing");
+        }
+        for (i, stat) in self.stats.iter_mut().enumerate() {
+            let (lo, hi, nan) = column_bounds(std::slice::from_ref(batch), i)?;
             stat.min = match (&stat.min, &lo) {
                 (None, _) => lo,
                 (_, None) => stat.min.take(),
@@ -440,16 +673,18 @@ async fn write_output(
                 stat.contains_nan = Some(stat.contains_nan == Some(true) || nan);
             }
         }
-        rows += batch.num_rows() as i64;
-        let nodes = node_idx.map(|index| batch.column(index).as_string::<i32>());
+        self.rows += batch.num_rows() as i64;
+        let nodes = self
+            .node_idx
+            .map(|index| batch.column(index).as_string::<i32>());
         if nodes.is_some_and(|nodes| nodes.null_count() != 0) {
             bail!("row-group column must not contain nulls");
         }
         let mut start = 0;
         while start < batch.num_rows() {
             let node = nodes.map_or("", |nodes| nodes.value(start));
-            if groups.boundary(node) {
-                writer.flush().await?;
+            if self.groups.boundary(node) {
+                self.writer.flush().await?;
             }
             let mut end = start + 1;
             while end < batch.num_rows() && nodes.is_none_or(|nodes| nodes.value(end) == node) {
@@ -457,46 +692,63 @@ async fn write_output(
             }
             let mut pos = start;
             while pos < end {
-                // Only long ranges may split a grouping value; ungrouped output uses size targets.
-                let n = if node_only || row_group_col.is_none() {
-                    (end - pos).min(TARGET_ROWS - groups.rows)
+                let n = if self.groups.node_only || self.node_idx.is_none() {
+                    (end - pos).min(TARGET_ROWS - self.groups.rows)
                 } else {
                     end - pos
                 };
-                let slice = batch.slice(pos, n);
-                groups.rows += n;
-                writer.write(&slice).await?;
-                groups.bytes = writer.in_progress_size();
+                self.writer.write(&batch.slice(pos, n)).await?;
+                self.groups.rows += n;
+                self.groups.bytes = self.writer.in_progress_size();
                 pos += n;
-                if (node_only || row_group_col.is_none())
-                    && (groups.rows >= TARGET_ROWS || groups.bytes >= TARGET_BYTES)
+                if (self.groups.node_only || self.node_idx.is_none())
+                    && (self.groups.rows >= TARGET_ROWS || self.groups.bytes >= TARGET_BYTES)
                 {
-                    writer.flush().await?;
-                    groups.rows = 0;
-                    groups.bytes = 0;
+                    self.writer.flush().await?;
+                    self.groups.rows = 0;
+                    self.groups.bytes = 0;
                 }
             }
             start = end;
         }
+        Ok(())
     }
-    let pq = writer.close().await?;
-    for (i, stat) in stats.iter_mut().enumerate() {
-        stat.size_bytes = pq
-            .row_groups()
-            .iter()
-            .map(|g| g.column(i).compressed_size())
-            .sum();
+
+    pub(super) async fn finish(self) -> Result<FileInfo> {
+        let pq = self.writer.close().await?;
+        let mut stats = self.stats;
+        for (i, stat) in stats.iter_mut().enumerate() {
+            stat.size_bytes = pq
+                .row_groups()
+                .iter()
+                .map(|g| g.column(i).compressed_size())
+                .sum();
+        }
+        let size = self.store.head(&self.path).await?.size;
+        let trailer = self.store.get_range(&self.path, size - 8..size).await?;
+        let footer = i64::from(u32::from_le_bytes(trailer[..4].try_into()?));
+        Ok(FileInfo {
+            name: self.name,
+            rows: self.rows,
+            size: i64::try_from(size)?,
+            footer,
+            stats,
+        })
     }
-    let size = work.store.head(&path).await?.size;
-    let trailer = work.store.get_range(&path, size - 8..size).await?;
-    let footer = i64::from(u32::from_le_bytes(trailer[..4].try_into()?));
-    Ok(FileInfo {
-        name,
-        rows,
-        size: i64::try_from(size)?,
-        footer,
-        stats,
-    })
+}
+
+async fn write_output(
+    work: &mut Work,
+    mut stream: SendableRecordBatchStream,
+    node_only: bool,
+    cols: &[&Column],
+    row_group_col: Option<&str>,
+) -> Result<FileInfo> {
+    let mut writer = OutputWriter::new(work, stream.schema(), node_only, cols, row_group_col)?;
+    while let Some(batch) = stream.try_next().await? {
+        writer.write(&batch).await?;
+    }
+    writer.finish().await
 }
 
 #[cfg(test)]
@@ -510,10 +762,39 @@ mod tests {
     use object_store::memory::InMemory;
 
     #[tokio::test]
+    async fn configured_run_target_controls_spill_threshold() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut work = Work::with_limits(store, "table/".into(), 1, 1024);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("node", DataType::Utf8, false),
+            Field::new(
+                "utcbegin",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(TimestampMicrosecondArray::from(vec![1]).with_timezone("UTC")),
+            ],
+        )
+        .unwrap();
+        let mut runs = Runs::new();
+        runs.push(batch, &mut work).await.unwrap();
+        assert_eq!(runs.paths.len(), 1);
+        assert_eq!(work.temps.len(), 1);
+    }
+
+    #[tokio::test]
     async fn footer_reads_use_bounded_ranges_and_clamp_to_file_size() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = ObjPath::from("footer");
-        store.put(&path, Bytes::from_static(b"0123456789").into()).await.unwrap();
+        store
+            .put(&path, Bytes::from_static(b"0123456789").into())
+            .await
+            .unwrap();
         let mut reader = BlobReader { store, path };
         for (suffix, expected) in [(4, "6789"), (10, "0123456789"), (100, "0123456789")] {
             assert_eq!(
@@ -802,12 +1083,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(removed, 0);
-        assert!(
-            runs.finish(&mut work, false, &[])
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(runs.finish(&mut work, false, &[]).await.unwrap().is_none());
         assert!(work.temps.is_empty());
     }
 
@@ -920,7 +1196,7 @@ mod tests {
 
     #[tokio::test]
     async fn report_layout_controls_sorting_and_optional_grouping() {
-        use crate::report::{Report, RTPRICES};
+        use crate::report::{RTPRICES, Report};
         static GROUPED: Report = Report {
             row_group_col: Some("region"),
             sort_cols: &["region", "utcbegin"],
@@ -946,10 +1222,7 @@ mod tests {
                 ),
             ]));
             let mut runs = Runs::for_report(report);
-            for (regions, times) in [
-                (vec!["B", "A"], vec![3, 4]),
-                (vec!["A", "B"], vec![2, 1]),
-            ] {
+            for (regions, times) in [(vec!["B", "A"], vec![3, 4]), (vec!["A", "B"], vec![2, 1])] {
                 let batch = RecordBatch::try_new(
                     schema.clone(),
                     vec![

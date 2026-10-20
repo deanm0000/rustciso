@@ -86,14 +86,62 @@ tables every 30 minutes and enqueues eligible month-grouped ranges with
 
 ## Azure runtime and failure behavior
 
-Sorting uses approximately 64 MiB input runs and eight-way streaming merge
-passes. Intermediate Parquet runs are stored beneath the table's
+The repacker first attempts an aligned row-group path when the report defines a
+`row_group_col` (currently `node`). It opens each source Parquet reader,
+inspects row-group min/max statistics, and requires exact non-null bounds and
+ordered row groups within each source. Different sources may have different
+boundaries and overlapping node ranges: the worker splits each row group by
+actual node values, retains unconsumed tails, and only emits a node after it has
+collected that node from every source. Actual values are checked against the
+statistics and ordering before use. This path writes replacement Parquet
+directly, without creating temporary sort-run blobs. A `unique` job can use it
+only when `unique` includes the `row_group_col`; deduplication then happens
+while that node is buffered.
+
+Metadata opens and row-group loads use up to eight concurrent source reads.
+Parquet column byte ranges are fetched through the object store's batched range
+API. Once a node is assembled, the worker also reads the next row groups for
+exhausted source cursors while writing the current node. Read-ahead is
+opportunistic: reservations include buffered source groups, the current output
+batches, and in-flight row-group size estimates within `REPACK_NODE_MB`.
+If there is no room for speculative reads, they wait until the output batches
+are released. There are no detached read tasks left running after fallback.
+
+Fastpack logs include the table and half-open local date range to distinguish
+daily and yearly jobs. They report metadata progress every 16 sources or 15 seconds, the
+first completed node, and then every 5000 nodes or 15 seconds of processing.
+Node progress includes live rows, duplicates removed, row groups read/total,
+buffered bytes, and elapsed time. While awaiting metadata, row-group reads,
+writes, or finalization, a wait message is emitted every 15 seconds.
+Success is logged after output finalization and row-count validation; catalog
+publication and cleanup follow separately. Progress is streamed to stderr
+(Live Log Stream) and buffered for the custom-handler response, so response
+logs still reach Application Insights only when the invocation returns.
+
+If statistics are missing/inexact, values do not match their declared order,
+or a node's working set exceeds the configured limit, the worker discards any
+unpublished aligned-path output and restarts through the normal external sort.
+The external sorter flushes approximately `REPACK_RUN_MB` of Arrow arrays
+per sorted run (default 128 MiB) and uses eight-way streaming merge passes.
+Intermediate Parquet runs are stored beneath the table's
 `_tmp/repack-<invocation-id>/` blob prefix, not on local Functions temp disk.
-These are sort-buffer targets, not a total process memory cap: decoding,
-sorting, merge readers, Parquet metadata and an open row group also use memory.
-Short-range groups must retain a whole node regardless of size.
-Deduplication adds a streaming pass sorted by the unique columns and descending
-download timestamp, followed by the normal `(node, utcbegin)` output sort.
+`REPACK_NODE_MB` sets the aligned path's per-node working-set limit (default
+256 MiB).
+
+Set `REPACK_RUN_MB` and `REPACK_NODE_MB` as positive whole MiB counts
+in the Function App configuration (1 MiB = 1,048,576 bytes), for example
+`REPACK_RUN_MB=128` and `REPACK_NODE_MB=256`. These replace the former
+`REPACK_RUN_BYTES` and `REPACK_NODE_BYTES` settings, which are no longer read.
+Missing, malformed, zero, or overflowing values use the defaults.
+These are memory targets, not total process memory caps: decoding,
+sorting, merge readers, Parquet metadata, open row groups, output encoding, and
+temporary copies also use memory. The aligned path retains one current row
+group per source while reconciling boundaries, so it may exceed its node target
+briefly; exceeding the target triggers the external-sort fallback. Short-range
+groups must retain a whole node regardless of size.
+External-sort deduplication uses a streaming pass sorted by the unique columns
+and descending download timestamp, followed by the normal `(node, utcbegin)`
+output sort.
 Parquet footer reads use a blob-size lookup and explicit bounded byte ranges;
 Azure Blob Storage does not support suffix-range requests.
 

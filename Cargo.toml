@@ -27,3 +27,6 @@ url = "2.5.8"
 uuid = { version = "1.28.0", features = ["v7"] }
 webpki-roots = "1"
 zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+async-trait = "0.1"
