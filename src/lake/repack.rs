@@ -34,6 +34,16 @@ pub struct Job {
 }
 
 impl Job {
+    fn report(&self) -> &'static crate::report::Report {
+        let (schema, table) = self.names();
+        crate::report::REPORTS
+            .iter()
+            .copied()
+            .find(|report| schema == SCHEMA && report.name == table)
+            // Preserve the existing price-table layout for manually named tables.
+            .unwrap_or(&crate::report::RTPRICES)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if let Some(unique) = &self.unique {
             if unique.is_empty() {
@@ -483,9 +493,9 @@ async fn prepare(
     job.validate_schema(&data_schema)?;
     let target = with_identity(&data_schema);
     let cols = resolve_columns(meta, &data_schema)?;
-    let mut runs = [sort::Runs::new(), sort::Runs::new(), sort::Runs::new()];
+    let mut runs: [_; 3] = std::array::from_fn(|_| sort::Runs::for_report(job.report()));
     if let Some(unique) = &job.unique {
-        runs[1] = sort::Runs::for_unique(unique);
+        runs[1].set_unique(unique);
     }
     let mut live_rows = 0i64;
     for (index, source) in sources.iter().enumerate() {
@@ -553,15 +563,23 @@ async fn prepare(
     Ok(files)
 }
 
-async fn lock_table(client: &Client, job: &Job) -> Result<()> {
+async fn lock_range(client: &Client, job: &Job) -> Result<()> {
     let (schema, table) = job.names();
-    let key = format!("rustciso.repack:{schema}.{table}");
-    // Session-scoped so sorting and all commit retries stay protected without
-    // holding an idle transaction. The owning connection releases it on exit.
-    client
-        .query_one("SELECT pg_advisory_lock(hashtextextended($1, 0))", &[&key])
+    let statement = client
+        .prepare("SELECT pg_advisory_lock(hashtextextended($1, 0))")
         .await
-        .context("acquiring repack advisory lock")?;
+        .context("preparing repack advisory locks")?;
+    // Local dates match the job's half-open bounds even across DST. Acquire
+    // chronologically to avoid deadlocks; keep session locks across commits.
+    let mut date = job.begin_date;
+    while date < job.end_date {
+        let key = format!("rustciso.repack:{schema}.{table}:{date}");
+        client
+            .query_one(&statement, &[&key])
+            .await
+            .with_context(|| format!("acquiring repack advisory lock for {schema}.{table} {date}"))?;
+        date = date.succ_opt().context("repack lock date is out of range")?;
+    }
     Ok(())
 }
 
@@ -743,9 +761,11 @@ pub async fn run(cfg: &Config, job: &Job, log: &mut Vec<String>) -> Result<()> {
         "{} [{}, {}) UTC: connecting to catalog", job.table, job.start()?, job.end()?
     ));
     let mut client = connect(cfg).await?;
-    progress(log, format!("waiting for repack advisory lock on {}", job.table));
-    lock_table(&client, job).await?;
-    progress(log, format!("acquired repack advisory lock on {}", job.table));
+    progress(log, format!("waiting for repack advisory locks on {} [{}, {}) America/Los_Angeles",
+        job.table, job.begin_date, job.end_date));
+    lock_range(&client, job).await?;
+    progress(log, format!("acquired repack advisory locks on {} [{}, {}) America/Los_Angeles",
+        job.table, job.begin_date, job.end_date));
     let (schema_name, table_name) = job.names();
     let meta = table_meta(&client, schema_name, table_name).await?;
     let tx = client
@@ -868,28 +888,71 @@ mod tests {
         let job: Job = serde_json::from_value(serde_json::json!({
             "table": "rtprices", "begin_date": "2026-01-01", "end_date": "2026-02-01"
         })).unwrap();
-        lock_table(&owner, &job).await.unwrap();
+        lock_range(&owner, &job).await.unwrap();
+        let owner_pid: i32 = owner.query_one("SELECT pg_backend_pid()", &[])
+            .await.unwrap().get(0);
+        let waiter_pid: i32 = waiter.query_one("SELECT pg_backend_pid()", &[])
+            .await.unwrap().get(0);
+        let held: i64 = other.query_one(
+            "SELECT count(*) FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND granted",
+            &[&owner_pid],
+        ).await.unwrap().get(0);
+        assert_eq!(held, 31);
         let alias: Job = serde_json::from_value(serde_json::json!({
             "table": "ciso.rtprices", "begin_date": "2026-01-15", "end_date": "2026-02-15"
         })).unwrap();
         let mut waiting = tokio::spawn(async move {
-            lock_table(&waiter, &alias).await.unwrap();
+            lock_range(&waiter, &alias).await.unwrap();
             waiter
         });
-        assert!(timeout(Duration::from_millis(100), &mut waiting).await.is_err());
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = other.query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks
+                      WHERE pid = $1 AND locktype = 'advisory' AND NOT granted)",
+                    &[&waiter_pid],
+                ).await.unwrap().get(0);
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("overlapping job should wait for a date lock");
+        assert!(!waiting.is_finished());
         // A commit must not release the lock while sorting or between retries.
         owner.transaction().await.unwrap().commit().await.unwrap();
         assert!(timeout(Duration::from_millis(100), &mut waiting).await.is_err());
-        let other_job: Job = serde_json::from_value(serde_json::json!({
-            "table": "ciso.fmprices", "begin_date": "2026-01-01", "end_date": "2026-02-01"
-        })).unwrap();
-        timeout(Duration::from_secs(5), lock_table(&other, &other_job)).await.unwrap().unwrap();
+        for (table, begin, end, expected_days) in [
+            ("ciso.fmprices", "2026-01-01", "2026-02-01", 31),
+            ("ciso.rtprices", "2025-12-01", "2026-01-01", 31),
+            ("ciso.rtprices", "2026-02-01", "2026-03-01", 28),
+            ("ciso.rtprices", "2026-03-07", "2026-03-10", 3),
+            ("ciso.rtprices", "2026-10-31", "2026-11-03", 3),
+        ] {
+            let other_job: Job = serde_json::from_value(serde_json::json!({
+                "table": table, "begin_date": begin, "end_date": end
+            })).unwrap();
+            timeout(Duration::from_secs(5), lock_range(&other, &other_job)).await.unwrap().unwrap();
+            let held: i64 = other.query_one(
+                "SELECT count(*) FROM pg_locks
+                  WHERE pid = pg_backend_pid() AND locktype = 'advisory' AND granted",
+                &[],
+            ).await.unwrap().get(0);
+            assert_eq!(held, expected_days);
+            other.query_one("SELECT pg_advisory_unlock_all()", &[]).await.unwrap();
+        }
         drop(other);
         other_connection.await.unwrap();
         // Early returns/errors drop the owning client just like normal completion.
         drop(owner);
         owner_connection.await.unwrap();
         let waiter = timeout(Duration::from_secs(5), waiting).await.unwrap().unwrap();
+        let held: i64 = waiter.query_one(
+            "SELECT count(*) FROM pg_locks
+              WHERE pid = pg_backend_pid() AND locktype = 'advisory' AND granted",
+            &[],
+        ).await.unwrap().get(0);
+        assert_eq!(held, 31);
         drop(waiter);
         waiter_connection.await.unwrap();
     }

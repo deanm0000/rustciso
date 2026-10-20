@@ -1,4 +1,4 @@
-//! Per-feed settings for the OASIS LMP price tables.
+//! Per-report OASIS settings and data layout.
 
 use crate::oasis::OasisQuery;
 use anyhow::{Context, Result, bail};
@@ -15,19 +15,25 @@ pub enum Window {
 }
 
 #[derive(Debug)]
-pub struct Market {
+pub struct Report {
     /// Function folder, queue name and table name (in `lake::SCHEMA`).
     pub name: &'static str,
     /// Prefix for the pivoted LMP columns (`{prefix}lmp`, `{prefix}mcc`, ...).
     pub prefix: &'static str,
     pub query: OasisQuery,
     pub window: Window,
+    /// Time covered by one data point, independent of the download window.
+    pub granularity: Duration,
+    /// Keep values of this column together in Parquet row groups, when set.
+    pub row_group_col: Option<&'static str>,
+    /// Ascending output ordering; the row-group column, if set, must be first.
+    pub sort_cols: &'static [&'static str],
     /// When OASIS is expected to have a window, relative to the window's start.
     pub ready_offset: Duration,
     pub not_ready_retry: std::time::Duration,
 }
 
-pub const RTPRICES: Market = Market {
+pub const RTPRICES: Report = Report {
     name: "rtprices",
     prefix: "rt",
     query: OasisQuery {
@@ -37,12 +43,15 @@ pub const RTPRICES: Market = Market {
         grp_type: "ALL",
     },
     window: Window::Hour,
+    granularity: Duration::minutes(5),
+    row_group_col: Some("node"),
+    sort_cols: &["node", "utcbegin"],
     // Hour close plus a 5 minute grace period.
     ready_offset: Duration::minutes(65),
     not_ready_retry: std::time::Duration::from_secs(60),
 };
 
-pub const FMPRICES: Market = Market {
+pub const FMPRICES: Report = Report {
     name: "fmprices",
     prefix: "fm",
     query: OasisQuery {
@@ -52,11 +61,14 @@ pub const FMPRICES: Market = Market {
         grp_type: "ALL_APNODES",
     },
     window: Window::Hour,
+    granularity: Duration::minutes(15),
+    row_group_col: Some("node"),
+    sort_cols: &["node", "utcbegin"],
     ready_offset: Duration::minutes(65),
     not_ready_retry: std::time::Duration::from_secs(60),
 };
 
-pub const DAPRICES: Market = Market {
+pub const DAPRICES: Report = Report {
     name: "daprices",
     prefix: "da",
     query: OasisQuery {
@@ -66,12 +78,15 @@ pub const DAPRICES: Market = Market {
         grp_type: "ALL_APNODES",
     },
     window: Window::Day,
+    granularity: Duration::hours(1),
+    row_group_col: Some("node"),
+    sort_cols: &["node", "utcbegin"],
     // DAM results post around 13:00 PT the day before; local midnight - 10h is 14:00 PT.
     ready_offset: Duration::hours(-10),
     not_ready_retry: std::time::Duration::from_secs(600),
 };
 
-pub const MARKETS: [&Market; 3] = [&RTPRICES, &FMPRICES, &DAPRICES];
+pub const REPORTS: [&Report; 3] = [&RTPRICES, &FMPRICES, &DAPRICES];
 
 fn local_midnight(date: NaiveDate) -> Result<DateTime<Utc>> {
     Los_Angeles
@@ -85,7 +100,7 @@ pub fn local_date(t: DateTime<Utc>) -> NaiveDate {
     t.with_timezone(&Los_Angeles).date_naive()
 }
 
-impl Market {
+impl Report {
     pub fn table(&self) -> String {
         format!("{}.{}", crate::lake::SCHEMA, self.name)
     }
@@ -104,11 +119,9 @@ impl Market {
     pub fn window_end(&self, start: DateTime<Utc>) -> Result<DateTime<Utc>> {
         match self.window {
             Window::Hour => Ok(start + Duration::hours(1)),
-            Window::Day => local_midnight(
-                local_date(start)
-                    .succ_opt()
-                    .context("date out of range")?,
-            ),
+            Window::Day => {
+                local_midnight(local_date(start).succ_opt().context("date out of range")?)
+            }
         }
     }
 
@@ -116,11 +129,9 @@ impl Market {
     pub fn prev_start(&self, start: DateTime<Utc>) -> Result<DateTime<Utc>> {
         match self.window {
             Window::Hour => Ok(start - Duration::hours(1)),
-            Window::Day => local_midnight(
-                local_date(start)
-                    .pred_opt()
-                    .context("date out of range")?,
-            ),
+            Window::Day => {
+                local_midnight(local_date(start).pred_opt().context("date out of range")?)
+            }
         }
     }
 
@@ -137,15 +148,37 @@ mod tests {
     #[test]
     fn daily_windows_follow_local_days_including_dst() {
         for (start, end, prev) in [
-            ("20261016T07:00-0000", "20261017T07:00-0000", "20261015T07:00-0000"),
-            ("20260308T08:00-0000", "20260309T07:00-0000", "20260307T08:00-0000"),
-            ("20261101T07:00-0000", "20261102T08:00-0000", "20261031T07:00-0000"),
-            ("20260309T07:00-0000", "20260310T07:00-0000", "20260308T08:00-0000"),
+            (
+                "20261016T07:00-0000",
+                "20261017T07:00-0000",
+                "20261015T07:00-0000",
+            ),
+            (
+                "20260308T08:00-0000",
+                "20260309T07:00-0000",
+                "20260307T08:00-0000",
+            ),
+            (
+                "20261101T07:00-0000",
+                "20261102T08:00-0000",
+                "20261031T07:00-0000",
+            ),
+            (
+                "20260309T07:00-0000",
+                "20260310T07:00-0000",
+                "20260308T08:00-0000",
+            ),
         ] {
             let s = parse_oasis_time(start).unwrap();
             DAPRICES.validate_start(s).unwrap();
-            assert_eq!(DAPRICES.window_end(s).unwrap(), parse_oasis_time(end).unwrap());
-            assert_eq!(DAPRICES.prev_start(s).unwrap(), parse_oasis_time(prev).unwrap());
+            assert_eq!(
+                DAPRICES.window_end(s).unwrap(),
+                parse_oasis_time(end).unwrap()
+            );
+            assert_eq!(
+                DAPRICES.prev_start(s).unwrap(),
+                parse_oasis_time(prev).unwrap()
+            );
         }
         let not_midnight = parse_oasis_time("20261016T08:00-0000").unwrap();
         assert!(DAPRICES.validate_start(not_midnight).is_err());
@@ -170,8 +203,17 @@ mod tests {
     #[test]
     fn names_are_unique() {
         assert_eq!(RTPRICES.table(), "ciso.rtprices");
-        let mut names: Vec<_> = MARKETS.iter().map(|m| m.name).collect();
+        let mut names: Vec<_> = REPORTS.iter().map(|m| m.name).collect();
         names.dedup();
-        assert_eq!(names.len(), MARKETS.len());
+        assert_eq!(names.len(), REPORTS.len());
+    }
+
+    #[test]
+    fn report_granularity_and_layout() {
+        for (report, minutes) in [(&RTPRICES, 5), (&FMPRICES, 15), (&DAPRICES, 60)] {
+            assert_eq!(report.granularity, Duration::minutes(minutes));
+            assert_eq!(report.row_group_col, Some("node"));
+            assert_eq!(report.sort_cols, &["node", "utcbegin"]);
+        }
     }
 }

@@ -1,7 +1,8 @@
 # Hourly RT prices queue trigger
 
 See also [fmprices](../fmprices/README.md) and [daprices](../daprices/README.md),
-which share this implementation (`src/prices.rs`, configured in `src/market.rs`).
+which share this implementation ([src/prices.rs](../src/prices.rs), configured
+in [src/report.rs](../src/report.rs)).
 
 Enqueue a base64-encoded JSON message on the `rtprices` Azure Storage queue
 (`AzureWebJobsStorage`):

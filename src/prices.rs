@@ -1,7 +1,7 @@
-//! Shared queue-triggered loader for the OASIS LMP price tables (see `market::MARKETS`).
+//! Shared queue-triggered loader for the OASIS LMP price tables (see `report::REPORTS`).
 
 use crate::azure::{FuncRequest, first_payload};
-use crate::market::{Market, local_date};
+use crate::report::{Report, local_date};
 use crate::oasis::{self, OasisResult};
 use crate::{AppState, HandlerResponse, lake, queue, respond, transform};
 use anyhow::{Context, Result};
@@ -31,7 +31,7 @@ pub struct Job {
 }
 
 impl Job {
-    fn continuations(&self, market: &Market, start: DateTime<Utc>) -> Result<Vec<Job>> {
+    fn continuations(&self, report: &Report, start: DateTime<Utc>) -> Result<Vec<Job>> {
         let mut jobs = Vec::new();
         for (bound, forward) in [(&self.get_next_until, true), (&self.get_prev_until, false)] {
             if let Some(bound) = bound {
@@ -43,9 +43,9 @@ impl Job {
                     }
                 })?;
                 let next_start = if forward {
-                    market.window_end(start)?
+                    report.window_end(start)?
                 } else {
-                    market.prev_start(start)?
+                    report.prev_start(start)?
                 };
                 if (forward && next_start <= until) || (!forward && next_start >= until) {
                     jobs.push(Job {
@@ -61,15 +61,15 @@ impl Job {
         Ok(jobs)
     }
 
-    fn repack(&self, market: &Market, start: DateTime<Utc>) -> Result<Option<lake::repack::Job>> {
+    fn repack(&self, report: &Report, start: DateTime<Utc>) -> Result<Option<lake::repack::Job>> {
         let date = local_date(start);
-        let first = local_date(market.prev_start(start)?) != date;
-        let last = local_date(market.window_end(start)?) != date;
+        let first = local_date(report.prev_start(start)?) != date;
+        let last = local_date(report.window_end(start)?) != date;
         if (self.repack_if_first == Some(true) && first)
             || (self.repack_if_last == Some(true) && last)
         {
             Ok(Some(lake::repack::Job {
-                table: market.table(),
+                table: report.table(),
                 begin_date: date,
                 end_date: date.succ_opt().context("repack end date is out of range")?,
                 unique: Some(vec!["utcbegin".into(), "node".into()]),
@@ -88,12 +88,12 @@ enum Outcome {
 
 async fn load_window(
     state: &AppState,
-    market: &Market,
+    report: &Report,
     start: DateTime<Utc>,
     log: &mut Vec<String>,
 ) -> Result<Outcome> {
-    let end = market.window_end(start)?;
-    let csvs = match oasis::fetch(&state.http, &market.query, start, end, log).await? {
+    let end = report.window_end(start)?;
+    let csvs = match oasis::fetch(&state.http, &report.query, start, end, log).await? {
         OasisResult::NotReady(msg) => return Ok(Outcome::NotReady(msg)),
         OasisResult::Csvs(csvs) => csvs,
     };
@@ -103,15 +103,15 @@ async fn load_window(
         csvs.iter().map(|(_, b)| b.len()).sum::<usize>()
     ));
     let downloaded_at = Utc::now();
-    let batches = transform::pivot(&csvs, market.prefix, downloaded_at)
+    let batches = transform::pivot(&csvs, report.prefix, downloaded_at)
         .await
         .context("pivoting csvs")?;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     log.push(format!("pivoted to {rows} rows"));
-    let r = lake::replace_window(&state.cfg, market.name, start, end, batches).await?;
+    let r = lake::replace_window(&state.cfg, report.name, start, end, batches).await?;
     log.push(format!(
         "{}: snapshot {} added file {} {} ({} rows, {} bytes); retired files {:?} ({} rows){}",
-        market.table(),
+        report.table(),
         r.snapshot_id,
         r.data_file_id,
         r.path,
@@ -128,11 +128,11 @@ async fn load_window(
 
 /// Delay until OASIS is expected to have the window starting at `next_start`, capped at 7 days.
 fn next_visibility(
-    market: &Market,
+    report: &Report,
     next_start: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> std::time::Duration {
-    (market.ready_at(next_start) - now)
+    (report.ready_at(next_start) - now)
         .to_std()
         .unwrap_or_default()
         .min(queue::MAX_VISIBILITY)
@@ -140,14 +140,14 @@ fn next_visibility(
 
 async fn enqueue(
     state: &AppState,
-    market: &Market,
+    report: &Report,
     job: &Job,
     delay: std::time::Duration,
     what: &str,
     log: &mut Vec<String>,
 ) -> Result<()> {
     state
-        .queue(market)?
+        .queue(report)?
         .send(&serde_json::to_string(job)?, delay)
         .await?;
     log.push(format!(
@@ -158,16 +158,16 @@ async fn enqueue(
     Ok(())
 }
 
-async fn handle(state: &AppState, market: &Market, job: Job, log: &mut Vec<String>) -> Result<()> {
+async fn handle(state: &AppState, report: &Report, job: Job, log: &mut Vec<String>) -> Result<()> {
     let start = oasis::parse_oasis_time(&job.startdatetime)?;
-    let continuations = job.continuations(market, start)?;
-    let repack = job.repack(market, start)?;
-    match load_window(state, market, start, log).await {
+    let continuations = job.continuations(report, start)?;
+    let repack = job.repack(report, start)?;
+    match load_window(state, report, start, log).await {
         Ok(Outcome::Loaded) => {
             for next in continuations {
                 let next_start = oasis::parse_oasis_time(&next.startdatetime)?;
-                let delay = next_visibility(market, next_start, Utc::now());
-                enqueue(state, market, &next, delay, "queued continuation", log).await?;
+                let delay = next_visibility(report, next_start, Utc::now());
+                enqueue(state, report, &next, delay, "queued continuation", log).await?;
             }
             if let Some(repack) = repack {
                 state
@@ -182,11 +182,11 @@ async fn handle(state: &AppState, market: &Market, job: Job, log: &mut Vec<Strin
         }
         Ok(Outcome::NotReady(msg)) => {
             log.push(format!("data not ready ({msg})"));
-            enqueue(state, market, &job, market.not_ready_retry, "requeued", log).await?;
+            enqueue(state, report, &job, report.not_ready_retry, "requeued", log).await?;
         }
         Err(e) => {
             log.push(format!("error loading {}: {e:#}", job.startdatetime));
-            let backlog = match state.queue(market)?.approximate_count().await {
+            let backlog = match state.queue(report)?.approximate_count().await {
                 Ok(n) => n,
                 Err(qe) => {
                     log.push(format!("could not read queue length: {qe:#}"));
@@ -199,13 +199,13 @@ async fn handle(state: &AppState, market: &Market, job: Job, log: &mut Vec<Strin
             } else {
                 ERROR_RETRY
             };
-            enqueue(state, market, &job, delay, "requeued", log).await?;
+            enqueue(state, report, &job, delay, "requeued", log).await?;
         }
     }
     Ok(())
 }
 
-fn parse_job(market: &Market, req: Result<Json<FuncRequest>, JsonRejection>) -> Result<Job> {
+fn parse_job(report: &Report, req: Result<Json<FuncRequest>, JsonRejection>) -> Result<Job> {
     let job: Job = req
         .map_err(|e| anyhow::anyhow!("{e}"))
         .and_then(|Json(r)| first_payload(r))
@@ -214,25 +214,25 @@ fn parse_job(market: &Market, req: Result<Json<FuncRequest>, JsonRejection>) -> 
                 "payload must look like {\"startdatetime\":\"20261016T07:00-0000\",\"get_next_until\":\"20261017T07:00-0000\",\"get_prev_until\":\"20261015T07:00-0000\",\"repack_if_last\":true,\"repack_if_first\":true}",
             )
         })?;
-    market.validate_start(oasis::parse_oasis_time(&job.startdatetime)?)?;
+    report.validate_start(oasis::parse_oasis_time(&job.startdatetime)?)?;
     Ok(job)
 }
 
 pub async fn handler(
     state: Arc<AppState>,
-    market: &'static Market,
+    report: &'static Report,
     req: Result<Json<FuncRequest>, JsonRejection>,
 ) -> HandlerResponse {
     let mut log = Vec::new();
-    let job = match parse_job(market, req) {
+    let job = match parse_job(report, req) {
         Ok(j) => j,
         Err(e) => {
-            log.push(format!("bad {} request: {e:#}", market.name));
+            log.push(format!("bad {} request: {e:#}", report.name));
             return respond(StatusCode::BAD_REQUEST, log);
         }
     };
-    log.push(format!("{} job {job:?}", market.name));
-    match handle(&state, market, job, &mut log).await {
+    log.push(format!("{} job {job:?}", report.name));
+    match handle(&state, report, job, &mut log).await {
         Ok(()) => respond(StatusCode::OK, log),
         Err(e) => {
             // Couldn't write to the queue: fail so the Functions host redelivers the original.
@@ -242,17 +242,17 @@ pub async fn handler(
     }
 }
 
-pub fn route(market: &'static Market) -> axum::routing::MethodRouter<Arc<AppState>> {
+pub fn route(report: &'static Report) -> axum::routing::MethodRouter<Arc<AppState>> {
     axum::routing::post(
         move |State(state): State<Arc<AppState>>,
-              req: Result<Json<FuncRequest>, JsonRejection>| handler(state, market, req),
+              req: Result<Json<FuncRequest>, JsonRejection>| handler(state, report, req),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::market::{DAPRICES, FMPRICES, RTPRICES};
+    use crate::report::{DAPRICES, FMPRICES, RTPRICES};
     use chrono::Duration;
     use chrono_tz::America::Los_Angeles;
 
@@ -296,7 +296,7 @@ mod tests {
         let mut j = job("20261016T07:00-0000");
         j.get_next_until = Some("20261016T10:00-0000".into());
         j.get_prev_until = Some("20261016T04:00-0000".into());
-        for market in [&RTPRICES, &FMPRICES] {
+        for report in [&RTPRICES, &FMPRICES] {
             for flags in [
                 (Some(true), Some(false)),
                 (Some(false), Some(true)),
@@ -305,7 +305,7 @@ mod tests {
                 j.repack_if_last = flags.0;
                 j.repack_if_first = flags.1;
                 let start = oasis::parse_oasis_time(&j.startdatetime).unwrap();
-                let children = j.continuations(market, start).unwrap();
+                let children = j.continuations(report, start).unwrap();
                 assert_eq!(children.len(), 2);
                 assert_eq!(children[0].get_next_until, j.get_next_until);
                 assert_eq!(children[0].get_prev_until, None);
@@ -318,7 +318,7 @@ mod tests {
                         let encoded = serde_json::to_string(&child).unwrap();
                         child = serde_json::from_str(&encoded).unwrap();
                         let child_start = oasis::parse_oasis_time(&child.startdatetime).unwrap();
-                        let mut next = child.continuations(market, child_start).unwrap();
+                        let mut next = child.continuations(report, child_start).unwrap();
                         if step == 3 {
                             assert!(next.is_empty());
                         } else {
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn repack_uses_local_day_boundaries_including_dst() {
-        for market in [&RTPRICES, &FMPRICES] {
+        for report in [&RTPRICES, &FMPRICES] {
             for (first, end, hours) in [
                 ("20261016T07:00-0000", "20261017T07:00-0000", 24),
                 ("20260308T08:00-0000", "20260309T07:00-0000", 23),
@@ -425,7 +425,7 @@ mod tests {
                         j.repack_if_first = first_flag;
                         j.repack_if_last = last_flag;
                         for hour in 0..hours {
-                            let repack = j.repack(market, start + Duration::hours(hour)).unwrap();
+                            let repack = j.repack(report, start + Duration::hours(hour)).unwrap();
                             let expected = (first_flag == Some(true) && hour == 0)
                                 || (last_flag == Some(true) && hour == hours - 1);
                             assert_eq!(repack.is_some(), expected, "{first} hour {hour}");
@@ -435,7 +435,7 @@ mod tests {
                                 assert_eq!(
                                     payload,
                                     serde_json::json!({
-                                        "table": market.table(),
+                                        "table": report.table(),
                                         "begin_date": start.with_timezone(&Los_Angeles).date_naive().to_string(),
                                         "end_date": end.with_timezone(&Los_Angeles).date_naive().to_string(),
                                         "unique": ["utcbegin", "node"],

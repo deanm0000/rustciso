@@ -1,16 +1,16 @@
 mod azure;
 mod config;
 mod lake;
-mod market;
 mod oasis;
 mod prices;
 mod queue;
+mod report;
 mod transform;
 
 use crate::azure::{FuncRequest, OutResponse, first_payload};
 use crate::config::Config;
-use crate::market::{MARKETS, Market};
 use crate::queue::QueueClient;
+use crate::report::{REPORTS, Report};
 use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
@@ -25,16 +25,16 @@ const REPACK_QUEUE_NAME: &str = "repack";
 struct AppState {
     cfg: Config,
     http: reqwest::Client,
-    /// One queue per market, named after it.
+    /// One queue per report, named after it.
     queues: HashMap<&'static str, QueueClient>,
     repack_queue: QueueClient,
 }
 
 impl AppState {
-    fn queue(&self, market: &Market) -> Result<&QueueClient> {
+    fn queue(&self, report: &Report) -> Result<&QueueClient> {
         self.queues
-            .get(market.name)
-            .with_context(|| format!("no queue configured for {}", market.name))
+            .get(report.name)
+            .with_context(|| format!("no queue configured for {}", report.name))
     }
 }
 
@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .build()?;
-    let queues = MARKETS
+    let queues = REPORTS
         .iter()
         .map(|m| {
             (
@@ -136,8 +136,8 @@ async fn main() -> Result<()> {
     let mut app = Router::new()
         .route("/repack", post(repack_handler))
         .route("/maintenance", post(maintenance_handler));
-    for market in MARKETS {
-        app = app.route(&format!("/{}", market.name), prices::route(market));
+    for report in REPORTS {
+        app = app.route(&format!("/{}", report.name), prices::route(report));
     }
     let app = app.with_state(state);
     let port: u16 = std::env::var("FUNCTIONS_CUSTOMHANDLER_PORT")

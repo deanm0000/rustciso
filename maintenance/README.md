@@ -11,6 +11,14 @@ The timezone casts remain in a separate statement, not an inlined CTE.
 Each table has its own transaction; the temporary table is dropped on commit
 or rolled back on failure.
 
+The `hours` statistic includes the final data interval, using each
+[`Report`](../src/report.rs)'s `granularity`: 5 minutes for `rtprices`,
+15 minutes for `fmprices`, and 60 minutes for `daprices`. This is independent
+of the hour/day download window. For example, a normal daily file covers
+24 hours and a spring DST-transition day covers 23 hours for all three reports.
+The duration is passed as a SQL parameter; the temp-table materialization
+and Los Angeles timezone conversions are unchanged.
+
 The supplied candidate query is preserved: select files whose Los Angeles
 minimum hour is `0` and maximum hour is `23`, group by the minimum's calendar
 month, and require the earliest minimum to equal the first of that month.
@@ -29,8 +37,10 @@ Discovery finishes for all three tables before enqueueing starts.
 Database and queue failures fail the invocation and are included in its logs.
 A later timer invocation can still enqueue the same range while a previous job
 is pending, and a partial enqueue failure can leave some jobs already queued.
-The repack worker serializes work per table with a Postgres advisory lock,
-then checks whether any supplied path is still active. If none remain, it
+The repack worker acquires per-table, per-local-date Postgres advisory locks
+for the requested range, then checks whether any supplied path is still active.
+Overlapping ranges wait; disjoint ranges on the same table may run concurrently.
+If none of the supplied paths remain active, it
 logs a successful skip without sorting or rewriting the data. Source rechecks
 at commit also protect against concurrent catalog changes from other writers.
 

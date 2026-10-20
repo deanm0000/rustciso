@@ -34,7 +34,7 @@ Omit `unique` or set it to `null` to preserve all rows without deduplication.
 "files": ["daily-01.parquet", "daily-02.parquet"]
 ```
 
-After acquiring the advisory lock, the worker checks the current snapshot for
+After acquiring the range's advisory locks, the worker checks the current snapshot for
 these paths in the requested table. If **any** are still active
 (`end_snapshot IS NULL`), the repack proceeds normally. If none remain, it
 logs a successful skip, assuming an earlier repack already handled the work.
@@ -44,6 +44,14 @@ freshness guard, not a filter: all current files overlapping the date range
 are still selected for repacking.
 
 ## Output layout
+
+Layout is configured per [`Report`](../src/report.rs): `sort_cols` gives the
+ascending output order, and optional `row_group_col` keeps values together in
+row groups. All three price reports use `["node", "utcbegin"]` and `Some("node")`,
+preserving the behavior below. A row-group column must be `varchar` and the
+first sort column. With no row-group column, normal size targets apply without
+waiting for value boundaries. Manually named tables outside the report registry
+retain the existing price-table layout and schema requirements.
 
 - One nonempty Parquet file contains all live rows in the requested interval,
   sorted ascending by `(node, utcbegin)`, with ZSTD level 3 compression.
@@ -95,16 +103,28 @@ still interrupt an invocation. This setting applies to the whole Function App.
 No durable continuation/checkpoint is implemented; a retry starts sorting again.
 Jobs carrying `files` skip retries when their original files are no longer active.
 
-Every repack acquires a blocking, session-scoped Postgres advisory lock before
-reading the catalog. Locks are keyed by the normalized schema/table name
-(`rtprices` and `ciso.rtprices` share a lock), so all repacks of a table are
-serialized, including overlapping but nonidentical ranges. Different tables
-can run concurrently. The same connection holds the lock through sorting,
+Every repack acquires one blocking, session-scoped Postgres advisory lock per
+Los Angeles calendar date in `[begin_date, end_date)` before reading the catalog.
+Locks are keyed by normalized schema/table name and local date
+(`rtprices` and `ciso.rtprices` share the same date locks). Overlapping ranges
+on a table wait for one another; disjoint ranges, including adjacent months,
+can run concurrently. Different tables can also run concurrently.
+Locks are acquired in chronological order to avoid deadlocks. DST days still
+require exactly one date lock, whether they contain 23, 24 or 25 hours.
+The same connection holds all locks through sorting,
 commit retries and cleanup, without keeping a transaction open during sorting.
-Normal returns, errors and disconnects release the lock when that connection
-closes. Waiting jobs check `files` only after acquiring the lock.
+Normal returns, errors and disconnects release the locks when that connection
+closes, including partially acquired ranges. Waiting jobs check `files` only
+after acquiring all locks.
 These locks coordinate repack workers, not ordinary ingestion writers;
 existing commit-time source/schema validation remains in place.
+Disjoint date ranges can still select the same boundary-straddling Parquet
+file; a conflicting publication fails the existing source recheck and retries.
+Each day consumes an advisory lock, so unusually long ranges may require
+Postgres lock-capacity tuning or smaller jobs.
+
+When deploying this change over the former table-wide locking implementation,
+drain running repacks first: old table keys and new date keys do not conflict.
 
 Progress is written immediately to the handler console, rather than waiting for
 the invocation response: catalog checks, each source file, sorted runs, merge

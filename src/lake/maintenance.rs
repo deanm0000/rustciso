@@ -3,8 +3,8 @@
 use super::{SCHEMA, connect};
 use crate::config::Config;
 use crate::lake::repack::Job;
-use crate::market::{MARKETS, Market};
 use crate::queue::QueueClient;
+use crate::report::{REPORTS, Report};
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
 use std::time::Duration;
@@ -14,7 +14,7 @@ const MATERIALIZE: &str = "
     CREATE TEMP TABLE maintenance_s1 ON COMMIT DROP AS
     SELECT f.path,
            extract(epoch FROM s.max_value::timestamptz - s.min_value::timestamptz
-                   + interval '5 minutes') / 3600 AS hours,
+                   + $3::bigint * interval '1 second') / 3600 AS hours,
            s.min_value::timestamptz AT TIME ZONE 'America/Los_Angeles' AS min_value,
            s.max_value::timestamptz AT TIME ZONE 'America/Los_Angeles' AS max_value,
            f.record_count
@@ -40,13 +40,13 @@ const CANDIDATES: &str = "
      ORDER BY mo";
 
 fn job(
-    market: &Market,
+    report: &Report,
     begin: NaiveDateTime,
     end: NaiveDateTime,
     files: Vec<String>,
 ) -> Result<Job> {
     let job = Job {
-        table: market.table(),
+        table: report.table(),
         begin_date: begin.date(),
         // Catalog maxima are inclusive; repack dates are exclusive local midnights.
         end_date: end
@@ -60,19 +60,22 @@ fn job(
     Ok(job)
 }
 
-async fn table_jobs(client: &impl GenericClient, market: &Market) -> Result<Vec<Job>> {
+async fn table_jobs(client: &impl GenericClient, report: &Report) -> Result<Vec<Job>> {
     // Keep this as a separate statement: inlining the timestamp casts in a CTE
     // can cause Postgres to cast unrelated column stats before filtering them.
     client
-        .execute(MATERIALIZE, &[&SCHEMA, &market.name])
+        .execute(
+            MATERIALIZE,
+            &[&SCHEMA, &report.name, &report.granularity.num_seconds()],
+        )
         .await
-        .with_context(|| format!("materializing {} timestamp stats", market.table()))?;
+        .with_context(|| format!("materializing {} timestamp stats", report.table()))?;
     client
         .query(CANDIDATES, &[])
         .await
-        .with_context(|| format!("finding {} repack ranges", market.table()))?
+        .with_context(|| format!("finding {} repack ranges", report.table()))?
         .into_iter()
-        .map(|row| job(market, row.try_get(0)?, row.try_get(1)?, row.try_get(2)?))
+        .map(|row| job(report, row.try_get(0)?, row.try_get(1)?, row.try_get(2)?))
         .collect()
 }
 
@@ -95,12 +98,12 @@ async fn enqueue(queue: &QueueClient, jobs: &[Job], log: &mut Vec<String>) -> Re
 pub async fn run(cfg: &Config, queue: &QueueClient, log: &mut Vec<String>) -> Result<()> {
     let mut client = connect(cfg).await?;
     let mut jobs = Vec::new();
-    for market in MARKETS {
+    for report in REPORTS {
         let tx = client.transaction().await?;
-        let found = table_jobs(&tx, market).await?;
+        let found = table_jobs(&tx, report).await?;
         log.push(format!(
             "{}: found {} maintenance ranges",
-            market.table(),
+            report.table(),
             found.len()
         ));
         jobs.extend(found);
@@ -117,14 +120,14 @@ pub async fn run(cfg: &Config, queue: &QueueClient, log: &mut Vec<String>) -> Re
 mod tests {
     use super::*;
     use crate::config::StorageAccount;
-    use crate::market::{DAPRICES, FMPRICES, RTPRICES};
+    use crate::report::{DAPRICES, FMPRICES, RTPRICES};
     use axum::{Router, routing::post};
     use base64::{Engine, engine::general_purpose::STANDARD as B64};
     use serde_json::json;
 
     #[test]
     fn inclusive_local_maximum_becomes_exclusive_next_day() {
-        for market in [&DAPRICES, &RTPRICES, &FMPRICES] {
+        for report in [&DAPRICES, &RTPRICES, &FMPRICES] {
             for (begin, end, exclusive) in [
                 ("2026-01-01T00:00:00", "2026-01-31T23:55:00", "2026-02-01"),
                 ("2026-03-01T00:00:00", "2026-03-31T23:55:00", "2026-04-01"),
@@ -134,7 +137,7 @@ mod tests {
                 ("2026-10-01T00:00:00", "2026-10-18T23:55:00", "2026-10-19"),
             ] {
                 let job = job(
-                    market,
+                    report,
                     begin.parse().unwrap(),
                     end.parse().unwrap(),
                     vec!["daily.parquet".into()],
@@ -143,7 +146,7 @@ mod tests {
                 assert_eq!(
                     serde_json::to_value(job).unwrap(),
                     json!({
-                        "table": market.table(),
+                        "table": report.table(),
                         "begin_date": &begin[..10],
                         "end_date": exclusive,
                         "unique": ["utcbegin", "node"],
@@ -292,7 +295,11 @@ mod tests {
             INSERT INTO ducklake.ducklake_file_column_stats
                 SELECT id, t, 1,
                        (day AT TIME ZONE 'America/Los_Angeles')::text,
-                       ((day + interval '23 hours 55 minutes') AT TIME ZONE 'America/Los_Angeles')::text
+                       ((day + interval '1 day'
+                         - CASE t WHEN 1 THEN interval '5 minutes'
+                                  WHEN 2 THEN interval '15 minutes'
+                                  ELSE interval '1 hour' END)
+                         AT TIME ZONE 'America/Los_Angeles')::text
                   FROM fixture_days
                  WHERE day NOT IN (timestamp '2026-04-01', timestamp '2026-07-31');
             UPDATE ducklake.ducklake_file_column_stats
@@ -306,9 +313,22 @@ mod tests {
                 SELECT data_file_id, table_id, 2, 'not a timestamp', 'not a timestamp'
                 FROM ducklake.ducklake_data_file;
         ").await.unwrap();
-        for market in MARKETS {
+        for report in REPORTS {
             let savepoint = tx.transaction().await.unwrap();
-            let jobs = table_jobs(&savepoint, market).await.unwrap();
+            let jobs = table_jobs(&savepoint, report).await.unwrap();
+            let hours = savepoint
+                .query(
+                    "SELECT hours::double precision FROM pg_temp.maintenance_s1
+                  WHERE min_value = timestamp '2026-01-01'
+                     OR min_value = timestamp '2026-03-08'
+                  ORDER BY min_value",
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(hours.len(), 2);
+            assert_eq!(hours[0].get::<_, f64>(0), 24.0);
+            assert_eq!(hours[1].get::<_, f64>(0), 23.0);
             let expected = [
                 ("2026-01-01", "2026-02-01", 31),
                 ("2026-02-01", "2026-03-01", 28),
@@ -316,7 +336,7 @@ mod tests {
                 ("2028-02-01", "2028-03-01", 29),
             ];
             assert_eq!(jobs.len(), expected.len());
-            let table_id = match market.name {
+            let table_id = match report.name {
                 "rtprices" => 1,
                 "fmprices" => 2,
                 "daprices" => 3,
@@ -333,7 +353,7 @@ mod tests {
                 assert_eq!(
                     serde_json::to_value(job).unwrap(),
                     json!({
-                        "table": market.table(),
+                        "table": report.table(),
                         "begin_date": begin,
                         "end_date": end,
                         "unique": ["utcbegin", "node"],

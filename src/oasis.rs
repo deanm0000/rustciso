@@ -224,7 +224,7 @@ mod tests {
         let t = parse_oasis_time("20261016T07:00-0000").unwrap();
         assert_eq!(format_oasis_time(t), "20261016T07:00-0000");
         let end = parse_oasis_time("20261017T07:00-0000").unwrap();
-        let url = build_url(&crate::market::DAPRICES.query, t, end);
+        let url = build_url(&crate::report::DAPRICES.query, t, end);
         assert_eq!(
             url,
             "https://oasis.caiso.com/oasisapi/SingleZip?resultformat=6&queryname=PRC_LMP&version=12&startdatetime=20261016T07:00-0000&enddatetime=20261017T07:00-0000&market_run_id=DAM&grp_type=ALL_APNODES"

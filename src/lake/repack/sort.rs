@@ -104,24 +104,40 @@ pub(super) struct Runs {
     bytes: usize,
     paths: Vec<ObjPath>,
     ordering: Vec<(String, bool)>,
+    report: &'static crate::report::Report,
 }
 
 impl Runs {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::for_report(&crate::report::RTPRICES)
+    }
+
+    pub(super) fn for_report(report: &'static crate::report::Report) -> Self {
         Self {
             batches: Vec::new(),
             bytes: 0,
             paths: Vec::new(),
-            ordering: vec![("node".into(), false), ("utcbegin".into(), false)],
+            ordering: report
+                .sort_cols
+                .iter()
+                .map(|name| ((*name).into(), false))
+                .collect(),
+            report,
         }
     }
 
+    #[cfg(test)]
     pub(super) fn for_unique(unique: &[String]) -> Self {
         let mut runs = Self::new();
-        runs.ordering = unique.iter().map(|name| (name.clone(), false)).collect();
-        runs.ordering.push(("downloaded_at".into(), true));
-        runs.ordering.push((ROW_ID.into(), true));
+        runs.set_unique(unique);
         runs
+    }
+
+    pub(super) fn set_unique(&mut self, unique: &[String]) {
+        self.ordering = unique.iter().map(|name| (name.clone(), false)).collect();
+        self.ordering.push(("downloaded_at".into(), true));
+        self.ordering.push((ROW_ID.into(), true));
     }
 
     pub(super) async fn push(&mut self, batch: RecordBatch, work: &mut Work) -> Result<()> {
@@ -185,14 +201,22 @@ impl Runs {
         node_only: bool,
         cols: &[&Column],
     ) -> Result<Option<FileInfo>> {
+        if self.report.sort_cols.is_empty() {
+            bail!("report sort columns must not be empty");
+        }
+        if let Some(column) = self.report.row_group_col
+            && self.report.sort_cols.first().copied() != Some(column)
+        {
+            bail!("row-group column {column} must be the first sort column");
+        }
         self.flush(work).await?;
         if self.paths.is_empty() {
             return Ok(None);
         }
         let stream = self.stream(work).await?;
-        eprintln!("repack: writing final output from {} runs; node-only={node_only}; temporary prefix={}",
-            self.paths.len(), work.tmp);
-        let file = write_output(work, stream, node_only, cols).await?;
+        eprintln!("repack: writing final output from {} runs; row-group column={:?}; single-value-groups={node_only}; temporary prefix={}",
+            self.paths.len(), self.report.row_group_col, work.tmp);
+        let file = write_output(work, stream, node_only, cols, self.report.row_group_col).await?;
         for path in &self.paths {
             work.remove_temp(path).await?;
         }
@@ -205,7 +229,7 @@ impl Runs {
         unique: &[String],
     ) -> Result<(Self, i64)> {
         self.flush(work).await?;
-        let mut output = Self::new();
+        let mut output = Self::for_report(self.report);
         if self.paths.is_empty() {
             return Ok((output, 0));
         }
@@ -358,12 +382,18 @@ async fn write_output(
     mut stream: SendableRecordBatchStream,
     node_only: bool,
     cols: &[&Column],
+    row_group_col: Option<&str>,
 ) -> Result<FileInfo> {
     let name = format!("ducklake-{}.parquet", Uuid::now_v7());
     let path = ObjPath::from(format!("{}{name}", work.prefix));
     work.outputs.push(path.clone());
     let schema = stream.schema();
-    let node_idx = schema.index_of("node")?;
+    let node_idx = row_group_col.map(|name| schema.index_of(name)).transpose()?;
+    if let Some(index) = node_idx
+        && schema.field(index).data_type() != &DataType::Utf8
+    {
+        bail!("row-group column must be varchar");
+    }
     let mut writer = AsyncArrowWriter::try_new_with_options(
         BufWriter::new(work.store.clone(), path.clone()),
         schema.clone(),
@@ -411,21 +441,24 @@ async fn write_output(
             }
         }
         rows += batch.num_rows() as i64;
-        let nodes = batch.column(node_idx).as_string::<i32>();
+        let nodes = node_idx.map(|index| batch.column(index).as_string::<i32>());
+        if nodes.is_some_and(|nodes| nodes.null_count() != 0) {
+            bail!("row-group column must not contain nulls");
+        }
         let mut start = 0;
         while start < batch.num_rows() {
-            let node = nodes.value(start);
+            let node = nodes.map_or("", |nodes| nodes.value(start));
             if groups.boundary(node) {
                 writer.flush().await?;
             }
             let mut end = start + 1;
-            while end < batch.num_rows() && nodes.value(end) == node {
+            while end < batch.num_rows() && nodes.is_none_or(|nodes| nodes.value(end) == node) {
                 end += 1;
             }
             let mut pos = start;
             while pos < end {
-                // Only long ranges may split a node. No automatic writer flush may cross nodes.
-                let n = if node_only {
+                // Only long ranges may split a grouping value; ungrouped output uses size targets.
+                let n = if node_only || row_group_col.is_none() {
                     (end - pos).min(TARGET_ROWS - groups.rows)
                 } else {
                     end - pos
@@ -435,7 +468,9 @@ async fn write_output(
                 writer.write(&slice).await?;
                 groups.bytes = writer.in_progress_size();
                 pos += n;
-                if node_only && (groups.rows >= TARGET_ROWS || groups.bytes >= TARGET_BYTES) {
+                if (node_only || row_group_col.is_none())
+                    && (groups.rows >= TARGET_ROWS || groups.bytes >= TARGET_BYTES)
+                {
                     writer.flush().await?;
                     groups.rows = 0;
                     groups.bytes = 0;
@@ -778,7 +813,12 @@ mod tests {
 
     #[tokio::test]
     async fn real_row_groups_obey_default_limit_without_splitting_short_range_nodes() {
-        for node_only in [false, true] {
+        for (node_only, row_group_col) in [
+            (false, Some("node")),
+            (true, Some("node")),
+            (false, None),
+            (true, None),
+        ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let mut work = Work::new(store.clone(), "table/".into());
             let schema = Arc::new(Schema::new(vec![
@@ -821,9 +861,15 @@ mod tests {
                 id: 2,
                 ty: "timestamptz".into(),
             };
-            let file = write_output(&mut work, stream, node_only, &[&node_col, &time_col])
-                .await
-                .unwrap();
+            let file = write_output(
+                &mut work,
+                stream,
+                node_only,
+                &[&node_col, &time_col],
+                row_group_col,
+            )
+            .await
+            .unwrap();
             let bytes = store
                 .get(&ObjPath::from(format!("table/{}", file.name)))
                 .await
@@ -840,15 +886,19 @@ mod tests {
                 .collect();
             assert_eq!(
                 sizes,
-                if node_only {
+                if row_group_col.is_none() {
+                    vec![TARGET_ROWS as i64, 5]
+                } else if node_only {
                     vec![TARGET_ROWS as i64, 3, 2]
                 } else {
                     vec![a_rows as i64, 2]
                 }
             );
-            for rg in builder.metadata().row_groups() {
-                let stats = rg.column(0).statistics().unwrap();
-                assert_eq!(stats.min_bytes_opt(), stats.max_bytes_opt());
+            if row_group_col.is_some() {
+                for rg in builder.metadata().row_groups() {
+                    let stats = rg.column(0).statistics().unwrap();
+                    assert_eq!(stats.min_bytes_opt(), stats.max_bytes_opt());
+                }
             }
         }
     }
@@ -866,5 +916,88 @@ mod tests {
         assert!(!g.boundary("A"));
         assert!(g.boundary("B"));
         assert_eq!(g.rows, 0);
+    }
+
+    #[tokio::test]
+    async fn report_layout_controls_sorting_and_optional_grouping() {
+        use crate::report::{Report, RTPRICES};
+        static GROUPED: Report = Report {
+            row_group_col: Some("region"),
+            sort_cols: &["region", "utcbegin"],
+            ..RTPRICES
+        };
+        static UNGROUPED: Report = Report {
+            row_group_col: None,
+            sort_cols: &["utcbegin", "region"],
+            ..RTPRICES
+        };
+        for (report, expected_times, expected_groups) in [
+            (&GROUPED, vec![2, 4, 1, 3], 2),
+            (&UNGROUPED, vec![1, 2, 3, 4], 1),
+        ] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let mut work = Work::new(store.clone(), "table/".into());
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new(
+                    "utcbegin",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    false,
+                ),
+            ]));
+            let mut runs = Runs::for_report(report);
+            for (regions, times) in [
+                (vec!["B", "A"], vec![3, 4]),
+                (vec!["A", "B"], vec![2, 1]),
+            ] {
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from(regions)),
+                        Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
+                    ],
+                )
+                .unwrap();
+                runs.push(batch, &mut work).await.unwrap();
+                runs.flush(&mut work).await.unwrap();
+            }
+            let region_col = Column {
+                id: 1,
+                ty: "varchar".into(),
+            };
+            let time_col = Column {
+                id: 2,
+                ty: "timestamptz".into(),
+            };
+            let file = runs
+                .finish(&mut work, true, &[&region_col, &time_col])
+                .await
+                .unwrap()
+                .unwrap();
+            let bytes = store
+                .get(&ObjPath::from(format!("table/{}", file.name)))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+            assert_eq!(reader.metadata().num_row_groups(), expected_groups);
+            let batches = reader
+                .build()
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            let batch = concat_batches(&schema, &batches).unwrap();
+            assert_eq!(
+                batch
+                    .column(1)
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .values()
+                    .as_ref(),
+                expected_times.as_slice()
+            );
+            assert!(work.temps.is_empty());
+        }
     }
 }
