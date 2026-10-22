@@ -1541,6 +1541,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "dkplus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "chrono-tz",
+ "datafusion",
+ "futures",
+ "object_store",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "url",
+ "uuid",
+ "webpki-roots",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3008,17 +3030,16 @@ name = "rustciso"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "axum",
  "base64 0.22.1",
  "bytes",
  "chrono",
  "chrono-tz",
  "datafusion",
+ "dkplus",
  "futures",
  "hmac 0.12.1",
  "httpdate",
- "object_store",
  "reqwest",
  "rustls",
  "serde",
@@ -3026,10 +3047,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tokio-postgres",
- "tokio-postgres-rustls",
  "url",
- "uuid",
- "webpki-roots",
  "zip",
 ]
 

@@ -62,11 +62,12 @@ async fn repack_handler(
         .map_err(|e| anyhow::anyhow!("{e}"))
         .and_then(|Json(r)| first_payload(r))
         .and_then(|v| {
-            serde_json::from_value::<lake::repack::Job>(v)
+            serde_json::from_value::<queue::Job<lake::repack::Job>>(v)
                 .context("payload must contain table, begin_date and end_date (YYYY-MM-DD)")
         })
-        .and_then(|job| {
-            job.validate()?;
+        .and_then(|mut job| {
+            job.payload.layout = lake::repack_layout(&job.payload.table);
+            job.payload.validate()?;
             Ok(job)
         });
     let job = match job {
@@ -80,11 +81,27 @@ async fn repack_handler(
     };
     let mut log = vec![format!("repack job {job:?}")];
     eprintln!("{}", log[0]);
-    match lake::repack::run(&state.cfg, &job, &mut log).await {
+    match lake::repack::run(&state.cfg, &job.payload, &mut log).await {
         Ok(()) => respond(StatusCode::OK, log),
         Err(e) => {
             log.push(format!("repack failed: {e:#}"));
-            respond(StatusCode::INTERNAL_SERVER_ERROR, log)
+            match state
+                .repack_queue
+                .retry_or_poison(
+                    &job,
+                    job.retry,
+                    std::time::Duration::from_secs(60),
+                    &format!("repack failed: {e:#}"),
+                    &mut log,
+                )
+                .await
+            {
+                Ok(()) => respond(StatusCode::OK, log),
+                Err(error) => {
+                    log.push(format!("failed to retry or poison repack: {error:#}"));
+                    respond(StatusCode::INTERNAL_SERVER_ERROR, log)
+                }
+            }
         }
     }
 }

@@ -1,5 +1,21 @@
 # Parquet repack queue trigger
 
+## Shared storage library
+
+The DuckLake catalog, Parquet writer, external sorting, and repack/fastpack
+implementation live in [`dkplus`](../../../modules/dkplus/README.md).
+This app retains the Azure trigger/queue contract and CISO layout/date policy.
+[`src/lake.rs`](../src/lake.rs) and
+[`src/lake/repack.rs`](../src/lake/repack.rs) are application adapters only.
+
+The Cargo path dependency is `../../modules/dkplus`, relative to this app's
+manifest. Local and CI release builds must make the sibling crate available at
+that relative location (currently `~/pyjs/modules/dkplus`). The deployed Functions
+binary does not need the crate's source. The existing
+[`compile_deploy.sh`](../compile_deploy.sh) build/publish commands are unchanged.
+Keep both directories when moving/checking out this app; cloning rustciso alone
+is not sufficient for a source build.
+
 Enqueue a base64-encoded JSON message on the `repack` Azure Storage queue
 (`AzureWebJobsStorage`), just like the existing `rtprices` queue:
 
@@ -18,6 +34,12 @@ define the half-open interval `[begin_date, end_date)` at midnight in
 boundary. Stored `utcbegin` timestamps remain UTC. For example, the range above
 is `[2026-01-01T08:00:00Z, 2026-10-01T07:00:00Z)`. A local day spanning a
 daylight-saving transition can contain 23 or 25 hours.
+
+Optional `retries` and `max_retries` use the shared
+[queue retry policy](../rtprices/README.md#retry-policy-all-queue-triggers).
+Failures retry after 60 seconds, incrementing `retries`; by default three retries
+are allowed after the initial attempt. Exhausted jobs move to `repack-poison`
+with their payload intact and the failure reason logged.
 
 `unique` is an optional list of column names. When supplied, only rows within
 the requested interval are deduplicated by that combination of columns, keeping
@@ -187,20 +209,25 @@ appropriate storage lifecycle policy, allowing more time than the longest job.
 Do not expire active jobs' runs.
 
 Files and schema are rechecked before publishing. Changed sources cause an
-explicit failure and host retry, rather than overwriting concurrent writes.
+explicit failure and bounded queue retry, rather than overwriting concurrent writes.
 Snapshot allocation conflicts are retried without re-sorting. Candidate final
 files are retained on commit errors, since a lost COMMIT response might mean
 they were published. Only remove such files after confirming they are
-unreferenced by **every retained snapshot**. The host's existing five-attempt
-policy eventually sends unsuccessful jobs to `repack-poison`.
+unreferenced by **every retained snapshot**. The queue retry policy above sends
+exhausted jobs to `repack-poison`. If sending a retry or poison message fails,
+the invocation fails so the host can redeliver or poison the original message
+according to `maxDequeueCount` in [`host.json`](../host.json).
 
 ## Current catalog support
 
 The trigger uses this app's existing Postgres DuckLake catalog and `Synblob`
 storage configuration. Supported tables are unpartitioned, Azure-backed tables
-with `varchar node`, microsecond `timestamptz utcbegin`, and columns of types
-`varchar`, `float64`, or microsecond `timestamptz`. File columns must carry
-DuckLake Parquet field IDs. Null sort keys are rejected.
+with `varchar node` and microsecond `timestamptz utcbegin`. The shared library also
+supports boolean, signed/unsigned 8/16/32/64-bit integers, float32/float64,
+varchar, Date32 dates, and naive/aware microsecond timestamps as data columns.
+File columns must carry DuckLake Parquet field IDs. Null window/group keys
+are rejected. Other scrapers can configure their own columns, timezone and
+grouping policy in dkplus; this trigger preserves the existing CISO policy.
 
 Unencrypted, non-partial Parquet positional delete files are applied while
 streaming; their `pos` entries must be unique and ascending. In-range inlined
@@ -211,22 +238,18 @@ they are never read as if they had no deletes.
 ## Local verification
 
 ```sh
-cargo test lake::repack
+cargo test --manifest-path ../../modules/dkplus/Cargo.toml repack
 ```
 
-With the app's environment variables set, the read-only catalog regression test
-also verifies timestamp parameters against real inlined tables:
+With an isolated, empty test Postgres database, all storage/catalog regressions
+can run without live catalog access. This includes inline text timestamp casts,
+typed windows, snapshot publication, advisory locks and file guards:
 
 ```sh
-cargo test inlined_text_timestamps_accept_datetime_parameters -- --ignored
-```
-
-With an isolated test Postgres database without a `ducklake` schema, the
-advisory-lock and file-guard regressions can be run without live catalog access:
-
-```sh
+DKPLUS_TEST_DATABASE_URL='postgresql://postgres@localhost:5432/testdb' \
 MAINTENANCE_TEST_DATABASE_URL='postgresql://postgres@localhost:5432/testdb' \
-  cargo test lake::repack::tests::postgres_ -- --ignored
+  cargo test --manifest-path ../../modules/dkplus/Cargo.toml \
+    -- --include-ignored --test-threads=1
 ```
 
 Tests use an in-memory object store with the same range-read and multipart

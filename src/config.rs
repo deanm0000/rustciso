@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use dkplus::config::{DEFAULT_REPACK_NODE_BYTES, DEFAULT_REPACK_RUN_BYTES};
 use std::collections::HashMap;
 use std::env;
 
@@ -6,8 +7,6 @@ use std::env;
 const PG_HOST: &str = "projectsdb.usspapps.com";
 const PG_PORT: u16 = 55669;
 const PG_DB: &str = "everything";
-pub(crate) const DEFAULT_REPACK_RUN_BYTES: usize = 128 * 1024 * 1024;
-pub(crate) const DEFAULT_REPACK_NODE_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct StorageAccount {
@@ -28,6 +27,18 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn lake(&self) -> dkplus::Config {
+        dkplus::Config {
+            postgres: self.postgres.clone(),
+            storage: dkplus::Storage::Azure {
+                account: self.lake_account.name.clone(),
+                access_key: self.lake_account.key.clone(),
+            },
+            repack_run_bytes: self.repack_run_bytes,
+            repack_node_bytes: self.repack_node_bytes,
+        }
+    }
+
     pub fn from_env() -> Result<Self> {
         let user = env::var("POSTGRES_USER").context("missing POSTGRES_USER")?;
         let pw = env::var("POSTGRES_PW").context("missing POSTGRES_PW")?;

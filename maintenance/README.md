@@ -1,5 +1,12 @@
 # Table maintenance timer
 
+Catalog candidate discovery is implemented by
+[`dkplus::maintenance`](../../../modules/dkplus/src/maintenance.rs).
+The [application module](../src/lake/maintenance.rs) keeps CISO report selection,
+job construction, timer behavior, and Azure queue delivery. See the
+[shared-library build requirements](../repack/README.md#shared-storage-library)
+for the sibling Cargo path dependency.
+
 Runs at minutes `00` and `30` of every hour (UTC by default) while backfilling.
 The timer is monitored by Azure Functions using `AzureWebJobsStorage` and does
 not run just because the app starts. To switch to the start of each month later,

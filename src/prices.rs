@@ -1,8 +1,8 @@
 //! Shared queue-triggered loader for the OASIS LMP price tables (see `report::REPORTS`).
 
 use crate::azure::{FuncRequest, first_payload};
-use crate::report::{Report, local_date};
 use crate::oasis::{self, OasisResult};
+use crate::report::{Report, local_date};
 use crate::{AppState, HandlerResponse, lake, queue, respond, transform};
 use anyhow::{Context, Result};
 use axum::Json;
@@ -28,6 +28,8 @@ pub struct Job {
     repack_if_last: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     repack_if_first: Option<bool>,
+    #[serde(flatten)]
+    retry: queue::RetryState,
 }
 
 impl Job {
@@ -54,6 +56,7 @@ impl Job {
                         get_prev_until: if forward { None } else { Some(bound.clone()) },
                         repack_if_last: self.repack_if_last,
                         repack_if_first: self.repack_if_first,
+                        retry: self.retry.fresh(),
                     });
                 }
             }
@@ -69,6 +72,7 @@ impl Job {
             || (self.repack_if_last == Some(true) && last)
         {
             Ok(Some(lake::repack::Job {
+                layout: lake::layout(report),
                 table: report.table(),
                 begin_date: date,
                 end_date: date.succ_opt().context("repack end date is out of range")?,
@@ -172,7 +176,13 @@ async fn handle(state: &AppState, report: &Report, job: Job, log: &mut Vec<Strin
             if let Some(repack) = repack {
                 state
                     .repack_queue
-                    .send(&serde_json::to_string(&repack)?, std::time::Duration::ZERO)
+                    .send(
+                        &serde_json::to_string(&queue::Job {
+                            payload: &repack,
+                            retry: job.retry.fresh(),
+                        })?,
+                        std::time::Duration::ZERO,
+                    )
                     .await?;
                 log.push(format!(
                     "queued repack of {} for {} America/Los_Angeles",
@@ -182,7 +192,14 @@ async fn handle(state: &AppState, report: &Report, job: Job, log: &mut Vec<Strin
         }
         Ok(Outcome::NotReady(msg)) => {
             log.push(format!("data not ready ({msg})"));
-            enqueue(state, report, &job, report.not_ready_retry, "requeued", log).await?;
+            if is_historical(start, Utc::now()) {
+                log.push(format!(
+                    "stopping historical no-data job {} (America/Los_Angeles); no continuation queued",
+                    job.startdatetime
+                ));
+            } else {
+                enqueue(state, report, &job, report.not_ready_retry, "requeued", log).await?;
+            }
         }
         Err(e) => {
             log.push(format!("error loading {}: {e:#}", job.startdatetime));
@@ -199,10 +216,23 @@ async fn handle(state: &AppState, report: &Report, job: Job, log: &mut Vec<Strin
             } else {
                 ERROR_RETRY
             };
-            enqueue(state, report, &job, delay, "requeued", log).await?;
+            state
+                .queue(report)?
+                .retry_or_poison(
+                    &job,
+                    job.retry,
+                    delay,
+                    &format!("error loading {}: {e:#}", job.startdatetime),
+                    log,
+                )
+                .await?;
         }
     }
     Ok(())
+}
+
+fn is_historical(start: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    local_date(start) < local_date(now)
 }
 
 fn parse_job(report: &Report, req: Result<Json<FuncRequest>, JsonRejection>) -> Result<Job> {
@@ -244,8 +274,9 @@ pub async fn handler(
 
 pub fn route(report: &'static Report) -> axum::routing::MethodRouter<Arc<AppState>> {
     axum::routing::post(
-        move |State(state): State<Arc<AppState>>,
-              req: Result<Json<FuncRequest>, JsonRejection>| handler(state, report, req),
+        move |State(state): State<Arc<AppState>>, req: Result<Json<FuncRequest>, JsonRejection>| {
+            handler(state, report, req)
+        },
     )
 }
 
@@ -263,6 +294,7 @@ mod tests {
             get_prev_until: None,
             repack_if_last: None,
             repack_if_first: None,
+            retry: queue::RetryState::default(),
         }
     }
 
@@ -280,7 +312,12 @@ mod tests {
         assert_eq!(children[1].startdatetime, "20261016T06:00-0000");
         for child in children {
             let child_start = oasis::parse_oasis_time(&child.startdatetime).unwrap();
-            assert!(child.continuations(&RTPRICES, child_start).unwrap().is_empty());
+            assert!(
+                child
+                    .continuations(&RTPRICES, child_start)
+                    .unwrap()
+                    .is_empty()
+            );
         }
 
         j.get_next_until = Some("20261016T07:59-0000".into());
@@ -461,7 +498,10 @@ mod tests {
         let much_later = oasis::parse_oasis_time("20261020T00:00-0000").unwrap();
         assert_eq!(next_visibility(&RTPRICES, next, much_later).as_secs(), 0);
         let long_before = oasis::parse_oasis_time("20261001T00:00-0000").unwrap();
-        assert_eq!(next_visibility(&RTPRICES, next, long_before), queue::MAX_VISIBILITY);
+        assert_eq!(
+            next_visibility(&RTPRICES, next, long_before),
+            queue::MAX_VISIBILITY
+        );
 
         let day = oasis::parse_oasis_time("20261017T07:00-0000").unwrap();
         let noon = oasis::parse_oasis_time("20261016T19:00-0000").unwrap();
@@ -496,5 +536,48 @@ mod tests {
             serde_json::to_string(&j).unwrap(),
             r#"{"startdatetime":"20261016T07:00-0000"}"#
         );
+    }
+
+    #[test]
+    fn continuations_reset_retries_and_inherit_limit() {
+        let mut job = job("20261016T07:00-0000");
+        job.get_next_until = Some("20261017T07:00-0000".into());
+        job.get_prev_until = Some("20261015T07:00-0000".into());
+        job.retry = queue::RetryState {
+            retries: Some(2),
+            max_retries: Some(5),
+        };
+        let encoded = serde_json::to_value(&job).unwrap();
+        assert_eq!(encoded["retries"], 2);
+        assert_eq!(encoded["max_retries"], 5);
+        let decoded: Job = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.retry, job.retry);
+        let start = oasis::parse_oasis_time(&job.startdatetime).unwrap();
+        for report in [&RTPRICES, &FMPRICES, &DAPRICES] {
+            let children = job.continuations(report, start).unwrap();
+            assert_eq!(children.len(), 2);
+            for child in children {
+                assert_eq!(child.retry.retries, None);
+                assert_eq!(child.retry.max_retries, Some(5));
+            }
+        }
+    }
+
+    #[test]
+    fn no_data_is_historical_only_before_current_pacific_date() {
+        let now = oasis::parse_oasis_time("20261021T06:30-0000").unwrap();
+        for (start, historical) in [
+            ("20261020T06:00-0000", true),
+            ("20261020T07:00-0000", false),
+            ("20261021T06:00-0000", false),
+            ("20261021T07:00-0000", false),
+        ] {
+            assert_eq!(
+                is_historical(oasis::parse_oasis_time(start).unwrap(), now),
+                historical
+            );
+        }
+        let after_midnight = oasis::parse_oasis_time("20261021T07:00-0000").unwrap();
+        assert!(is_historical(now, after_midnight));
     }
 }

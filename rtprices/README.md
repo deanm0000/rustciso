@@ -37,8 +37,31 @@ After successfully loading the hour:
 
 Continuations wait until their hour has closed plus five minutes, with queue
 visibility capped at seven days. Historical hours are immediately visible.
-Not-ready responses and load failures retry the original job with all its
-options intact; they do not emit continuations or repack jobs.
+Retries do not emit continuations or repack jobs.
+
+## Retry policy (all queue triggers)
+
+All price and repack queue jobs accept optional nonnegative integer fields:
+
+- `retries`: retries already scheduled for this job; omitted or null means `0`.
+- `max_retries`: retries allowed after the initial attempt; omitted or null
+  means `3` (four total attempts). Set `0` to disable failure retries.
+
+Each failure requeue increments `retries` and preserves the other options.
+Price failures retain their existing delay: 60 seconds, or one hour when the
+queue has at least five messages. Repack failures retry after 60 seconds.
+Once the limit is reached, the failed job is sent to `<queue>-poison`
+(created if necessary), with its payload and retry count intact, and the
+reason is logged. No further retry or continuation is scheduled.
+Successful continuation and price-generated repack jobs inherit `max_retries`
+but start with a fresh retry count. Maintenance-generated repack jobs use
+the defaults.
+
+OASIS "no data" responses for dates before today in `America/Los_Angeles`
+stop immediately, logging the reason without requeuing, poisoning, or emitting
+continuations. For today's date or future dates, they keep polling without
+incrementing `retries` or consuming the retry allowance (every minute for RT/FMM,
+every ten minutes for DAM).
 
 OASIS ZIP responses containing error `1015` ("GroupZip DownLoad is in
 Processing") are retried every five seconds for up to one minute after the

@@ -1,43 +1,14 @@
 //! Finds daily-file ranges eligible for repacking, materializing timestamp stats first.
 
-use super::{SCHEMA, connect};
 use crate::config::Config;
 use crate::lake::repack::Job;
 use crate::queue::QueueClient;
 use crate::report::{REPORTS, Report};
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
+use dkplus::connect;
 use std::time::Duration;
 use tokio_postgres::GenericClient;
-
-const MATERIALIZE: &str = "
-    CREATE TEMP TABLE maintenance_s1 ON COMMIT DROP AS
-    SELECT f.path,
-           extract(epoch FROM s.max_value::timestamptz - s.min_value::timestamptz
-                   + $3::bigint * interval '1 second') / 3600 AS hours,
-           s.min_value::timestamptz AT TIME ZONE 'America/Los_Angeles' AS min_value,
-           s.max_value::timestamptz AT TIME ZONE 'America/Los_Angeles' AS max_value,
-           f.record_count
-      FROM ducklake.ducklake_data_file f
-      INNER JOIN ducklake.ducklake_file_column_stats s USING (data_file_id, table_id)
-      INNER JOIN ducklake.ducklake_table t USING (table_id)
-      INNER JOIN ducklake.ducklake_schema sc USING (schema_id)
-      INNER JOIN ducklake.ducklake_column c USING (table_id, column_id)
-     WHERE f.end_snapshot IS NULL AND sc.schema_name = $1
-       AND t.table_name = $2 AND c.column_name = 'utcbegin'";
-
-const CANDIDATES: &str = "
-    WITH s2 AS (
-        SELECT date_trunc('month', min_value) AS mo, path, min_value, max_value
-          FROM pg_temp.maintenance_s1
-         WHERE extract(hour FROM max_value) = 23 AND extract(hour FROM min_value) = 0
-    )
-    SELECT min(min_value) AS begin_date, max(max_value) AS end_date, array_agg(path) AS files
-      FROM s2
-     GROUP BY mo
-    HAVING min(min_value) = mo
-       AND count(1) = extract(day FROM mo + interval '1 month' - interval '5 minutes')
-     ORDER BY mo";
 
 fn job(
     report: &Report,
@@ -46,6 +17,7 @@ fn job(
     files: Vec<String>,
 ) -> Result<Job> {
     let job = Job {
+        layout: super::layout(report),
         table: report.table(),
         begin_date: begin.date(),
         // Catalog maxima are inclusive; repack dates are exclusive local midnights.
@@ -61,22 +33,16 @@ fn job(
 }
 
 async fn table_jobs(client: &impl GenericClient, report: &Report) -> Result<Vec<Job>> {
-    // Keep this as a separate statement: inlining the timestamp casts in a CTE
-    // can cause Postgres to cast unrelated column stats before filtering them.
-    client
-        .execute(
-            MATERIALIZE,
-            &[&SCHEMA, &report.name, &report.granularity.num_seconds()],
-        )
-        .await
-        .with_context(|| format!("materializing {} timestamp stats", report.table()))?;
-    client
-        .query(CANDIDATES, &[])
-        .await
-        .with_context(|| format!("finding {} repack ranges", report.table()))?
-        .into_iter()
-        .map(|row| job(report, row.try_get(0)?, row.try_get(1)?, row.try_get(2)?))
-        .collect()
+    dkplus::maintenance::table_candidates(
+        client,
+        &super::layout(report),
+        report.name,
+        report.granularity,
+    )
+    .await?
+    .into_iter()
+    .map(|candidate| job(report, candidate.begin, candidate.end, candidate.files))
+    .collect()
 }
 
 async fn enqueue(queue: &QueueClient, jobs: &[Job], log: &mut Vec<String>) -> Result<()> {
@@ -96,7 +62,7 @@ async fn enqueue(queue: &QueueClient, jobs: &[Job], log: &mut Vec<String>) -> Re
 }
 
 pub async fn run(cfg: &Config, queue: &QueueClient, log: &mut Vec<String>) -> Result<()> {
-    let mut client = connect(cfg).await?;
+    let mut client = connect(&cfg.lake()).await?;
     let mut jobs = Vec::new();
     for report in REPORTS {
         let tx = client.transaction().await?;
