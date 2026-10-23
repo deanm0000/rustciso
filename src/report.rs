@@ -22,8 +22,6 @@ pub struct Report {
     pub prefix: &'static str,
     pub query: OasisQuery,
     pub window: Window,
-    /// Time covered by one data point, independent of the download window.
-    pub granularity: Duration,
     /// When OASIS is expected to have a window, relative to the window's start.
     pub ready_offset: Duration,
     pub not_ready_retry: std::time::Duration,
@@ -39,7 +37,6 @@ pub const RTPRICES: Report = Report {
         grp_type: "ALL",
     },
     window: Window::Hour,
-    granularity: Duration::minutes(5),
     // Hour close plus a 5 minute grace period.
     ready_offset: Duration::minutes(65),
     not_ready_retry: std::time::Duration::from_secs(60),
@@ -55,7 +52,6 @@ pub const FMPRICES: Report = Report {
         grp_type: "ALL",
     },
     window: Window::Hour,
-    granularity: Duration::minutes(15),
     ready_offset: Duration::minutes(65),
     not_ready_retry: std::time::Duration::from_secs(60),
 };
@@ -70,7 +66,6 @@ pub const DAPRICES: Report = Report {
         grp_type: "ALL",
     },
     window: Window::Day,
-    granularity: Duration::hours(1),
     // DAM results post around 13:00 PT the day before; local midnight - 10h is 14:00 PT.
     ready_offset: Duration::hours(-10),
     not_ready_retry: std::time::Duration::from_secs(600),
@@ -196,12 +191,5 @@ mod tests {
         let mut names: Vec<_> = REPORTS.iter().map(|m| m.name).collect();
         names.dedup();
         assert_eq!(names.len(), REPORTS.len());
-    }
-
-    #[test]
-    fn report_granularity() {
-        for (report, minutes) in [(&RTPRICES, 5), (&FMPRICES, 15), (&DAPRICES, 60)] {
-            assert_eq!(report.granularity, Duration::minutes(minutes));
-        }
     }
 }

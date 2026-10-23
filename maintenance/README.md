@@ -1,9 +1,10 @@
 # Table maintenance timer
 
-Catalog candidate discovery is implemented by
-[`dkplus::maintenance`](../../../modules/dkplus/src/maintenance.rs).
-The [application module](../src/lake/maintenance.rs) keeps CISO report selection,
-job construction, timer behavior, and Azure queue delivery. See the
+Candidate planning and rule evaluation are provided by
+[`dkplus::maintenance`](../../../modules/dkplus/src/maintenance.rs). The
+[application module](../src/lake/maintenance.rs) selects the CISO price tables,
+opens a planning transaction for each table, and sends discovered plans to the
+existing [`repack` queue](../repack/README.md). See the
 [shared-library build requirements](../repack/README.md#shared-storage-library)
 for the sibling Cargo path dependency.
 
@@ -12,45 +13,28 @@ The timer is monitored by Azure Functions using `AzureWebJobsStorage` and does
 not run just because the app starts. To switch to the start of each month later,
 change `schedule` in [function.json](./function.json) to `0 0 0 1 * *`.
 
-For each of `ciso.daprices`, `ciso.rtprices`, and `ciso.fmprices`, maintenance
-materializes active `utcbegin` file statistics in a **Postgres temporary table**.
-The timezone casts remain in a separate statement, not an inlined CTE.
-Each table has its own transaction; the temporary table is dropped on commit
-or rolled back on failure.
+For each of `ciso.daprices`, `ciso.rtprices`, and `ciso.fmprices`, dkplus reads
+active file statistics and plans non-overlapping repacks from the table's
+`dkplus.granularity` and `dkplus.repack_level<N>_*` tags. It does not read
+Parquet files while planning. Levels, interval rules, calendar boundaries, and
+the required granularity tag are documented in the
+[dkplus maintenance guide](../../../modules/dkplus/README.md#maintenance-repack-levels).
+The timer sends one serialized `PotentialRepack` plan per eligible group. The
+plan includes its bounds, applicable rules, granularity, and source catalog
+paths.
 
-The `hours` statistic includes the final data interval, using each
-[`Report`](../src/report.rs)'s `granularity`: 5 minutes for `rtprices`,
-15 minutes for `fmprices`, and 60 minutes for `daprices`. This is independent
-of the hour/day download window. For example, a normal daily file covers
-24 hours and a spring DST-transition day covers 23 hours for all three reports.
-The duration is passed as a SQL parameter; the temp-table materialization
-and Los Angeles timezone conversions are unchanged.
+On the repack queue, the worker resolves the table policy and calls
+`dkplus::maintenance::do_repack` with `Strictness::Raise`. The library rechecks
+that the source files are still current and the rules still produce the
+original window. A stale plan is logged and skipped. For a valid plan, the
+source paths are used as a freshness guard and the data is compacted only when
+the selected sources can produce exactly one in-window output file.
 
-The supplied candidate query is preserved: select files whose Los Angeles
-minimum hour is `0` and maximum hour is `23`, group by the minimum's calendar
-month, and require the earliest minimum to equal the first of that month.
-The number of files must equal the number of days in the month, including
-February in leap years. This is still a file-statistics heuristic, not a check
-for exactly one file per distinct day or contiguous data.
-
-Each result produces one job on the existing
-[`repack` queue](../repack/README.md), with `"files"` containing the catalog
-paths from `array_agg(path)`. Deduplication and output layout are read from the three
-tables' DuckLake `dkplus.*` tags when the worker handles the job.
-The minimum's local date becomes `begin_date`; the day **after** the maximum's
-local date becomes the exclusive `end_date`, including the last day's rows.
-Los Angeles daylight-saving boundaries are handled by the repack worker.
-Discovery finishes for all three tables before enqueueing starts.
-
-Database and queue failures fail the invocation and are included in its logs.
-A later timer invocation can still enqueue the same range while a previous job
-is pending, and a partial enqueue failure can leave some jobs already queued.
-The repack worker acquires per-table, per-UTC-date Postgres advisory locks
-covering the requested range, then checks whether any supplied path is still active.
-Overlapping ranges wait; disjoint ranges on the same table may run concurrently.
-If none of the supplied paths remain active, it
-logs a successful skip without sorting or rewriting the data. Source rechecks
-at commit also protect against concurrent catalog changes from other writers.
+Database or queue failures fail the timer invocation and are included in its
+logs. Discovery finishes for all three tables before enqueueing starts, though
+a partial enqueue failure can leave some plans queued. A later timer invocation
+may discover a plan again while an earlier copy is pending; execution-time
+revalidation makes redundant plans safe.
 
 ## Verification
 
@@ -58,14 +42,6 @@ at commit also protect against concurrent catalog changes from other writers.
 cargo test lake::maintenance
 ```
 
-The SQL regression test needs an isolated Postgres database without an existing
-`ducklake` schema. It creates fixture tables and rolls them back:
-
-```sh
-MAINTENANCE_TEST_DATABASE_URL='postgresql://postgres@localhost:5432/testdb' \
-  cargo test lake::maintenance -- --include-ignored
-```
-
-Live Azure timer delivery, Postgres discovery, and queue processing require
-deployment integration verification. Running unit tests does not enqueue
-jobs in Azure or modify the live catalog.
+Live Azure timer delivery, Postgres planning, and queue processing require
+deployment integration verification. Unit tests do not enqueue jobs in Azure or
+modify the live catalog.

@@ -75,7 +75,7 @@ impl Job {
                 &report.table(),
                 date,
                 date.succ_opt().context("repack end date is out of range")?,
-            )))
+            )?))
         } else {
             Ok(None)
         }
@@ -181,7 +181,7 @@ async fn handle(state: &AppState, report: &Report, job: Job, log: &mut Vec<Strin
                     .await?;
                 log.push(format!(
                     "queued repack of {} for {} America/Los_Angeles",
-                    repack.table, repack.begin_date
+                    repack.table, repack.begin
                 ));
             }
         }
@@ -280,7 +280,6 @@ mod tests {
     use super::*;
     use crate::report::{DAPRICES, FMPRICES, RTPRICES};
     use chrono::Duration;
-    use chrono_tz::America::Los_Angeles;
 
     fn job(start: &str) -> Job {
         Job {
@@ -412,8 +411,8 @@ mod tests {
             if let Some(repack) = repack {
                 repack.validate().unwrap();
                 assert_eq!(repack.table.to_string(), "ciso.daprices");
-                assert_eq!(repack.begin_date.to_string(), "2026-11-01");
-                assert_eq!(repack.end_date.to_string(), "2026-11-02");
+                assert_eq!(repack.begin.utc().to_rfc3339(), "2026-11-01T07:00:00+00:00");
+                assert_eq!(repack.end.utc().to_rfc3339(), "2026-11-02T08:00:00+00:00");
             }
         }
     }
@@ -468,21 +467,15 @@ mod tests {
                                     payload,
                                     serde_json::json!({
                                         "table": report.table(),
-                                        "begin_date": start.with_timezone(&Los_Angeles).date_naive().to_string(),
-                                        "end_date": end.with_timezone(&Los_Angeles).date_naive().to_string(),
+                                        "begin": {"tz": format!("{}Z", start.format("%Y-%m-%dT%H:%M:%S"))},
+                                        "end": {"tz": format!("{}Z", end.format("%Y-%m-%dT%H:%M:%S"))},
                                     })
                                 );
                                 let decoded: lake::repack::Job =
                                     serde_json::from_value(payload).unwrap();
                                 assert_eq!(decoded.table.to_string(), report.table());
-                                assert_eq!(
-                                    decoded.begin_date,
-                                    start.with_timezone(&Los_Angeles).date_naive()
-                                );
-                                assert_eq!(
-                                    decoded.end_date,
-                                    end.with_timezone(&Los_Angeles).date_naive()
-                                );
+                                assert_eq!(decoded.begin.utc(), start);
+                                assert_eq!(decoded.end.utc(), end);
                             }
                         }
                     }

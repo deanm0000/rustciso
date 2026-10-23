@@ -24,17 +24,25 @@ Enqueue a base64-encoded JSON message on the `repack` Azure Storage queue
 ```json
 {
   "table": "rtprices",
-  "begin_date": "2026-01-01",
-  "end_date": "2026-10-01"
+  "begin": {"tz": "2026-01-01T08:00:00Z"},
+  "end": {"tz": "2026-10-01T07:00:00Z"}
 }
 ```
 
-`table` defaults to the `ciso` schema; `ciso.rtprices` is also accepted. Dates
-define the half-open interval `[begin_date, end_date)` at midnight in
-`America/Los_Angeles`, with daylight-saving rules applied independently to each
-boundary. Stored `utcbegin` timestamps remain UTC. For example, the range above
-is `[2026-01-01T08:00:00Z, 2026-10-01T07:00:00Z)`. A local day spanning a
+`begin` and `end` are `dkplus::repack::Bound` values and define the half-open
+interval `[begin, end)`. `table` defaults to the `ciso` schema;
+`ciso.rtprices` is also accepted. The older `begin_date`/`end_date` format is
+still accepted for queued messages during rollout; those dates are converted
+to `America/Los_Angeles` midnight with daylight-saving rules applied to each
+boundary. Stored `utcbegin` timestamps remain UTC. For example, the legacy
+range `2026-01-01` through `2026-10-01` becomes
+`[2026-01-01T08:00:00Z, 2026-10-01T07:00:00Z)`. A local day spanning a
 daylight-saving transition can contain 23 or 25 hours.
+
+The maintenance timer sends serialized `dkplus::maintenance::PotentialRepack`
+plans on this same queue. These include the rule level, granularity, bounds,
+and source paths. The worker rechecks each plan against current catalog
+statistics before repacking; stale plans are logged and skipped.
 
 Optional `retries` and `max_retries` use the shared
 [queue retry policy](../rtprices/README.md#retry-policy-all-queue-triggers).
@@ -59,14 +67,14 @@ existing columns, and the table must have the configured microsecond timestamp.
 "files": ["daily-01.parquet", "daily-02.parquet"]
 ```
 
-After acquiring the range's advisory locks, the worker checks the current snapshot for
-these paths in the requested table. If **any** are still active
-(`end_snapshot IS NULL`), the repack proceeds normally. If none remain, it
-logs a successful skip, assuming an earlier repack already handled the work.
-An empty list also skips. Omit `files` or set it to `null` to bypass this guard,
-preserving existing manually queued and price-triggered jobs. The list is a
-freshness guard, not a filter: all current files overlapping the date range
-are still selected for repacking.
+For manual jobs, after acquiring the range's advisory locks the worker checks
+the current snapshot for these paths in the requested table. If **any** are
+still active (`end_snapshot IS NULL`), the repack proceeds normally. If none
+remain, it logs a successful skip. An empty list also skips. Omit `files` or
+set it to `null` to bypass this guard, preserving existing manually queued and
+price-triggered jobs. The list is a freshness guard, not a filter: all current
+files overlapping the window are still selected for repacking. Maintenance
+plans additionally revalidate their full planning rules before execution.
 
 ## Output layout
 

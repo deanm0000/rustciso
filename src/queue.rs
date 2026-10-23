@@ -158,8 +158,58 @@ mod tests {
             "retries": 1,
             "max_retries": 5
         });
-        let job: Job<crate::lake::repack::Job> = serde_json::from_value(value.clone()).unwrap();
+        let job: Job<crate::lake::repack::RepackPayload> = serde_json::from_value(value).unwrap();
         assert_eq!(job.retry.retries, Some(1));
+        let crate::lake::repack::RepackPayload::Job(payload) = &job.payload else {
+            panic!("expected a regular repack job");
+        };
+        assert_eq!(
+            payload.begin.utc().to_rfc3339(),
+            "2023-07-09T07:00:00+00:00"
+        );
+        assert_eq!(payload.end.utc().to_rfc3339(), "2023-07-10T07:00:00+00:00");
+        assert_eq!(
+            serde_json::to_value(job).unwrap(),
+            json!({
+                "table": "ciso.daprices",
+                "begin": {"tz": "2023-07-09T07:00:00Z"},
+                "end": {"tz": "2023-07-10T07:00:00Z"},
+                "unique": ["utcbegin", "node"],
+                "files": ["daily.parquet"],
+                "retries": 1,
+                "max_retries": 5
+            })
+        );
+    }
+
+    #[test]
+    fn maintenance_plan_retry_envelope_roundtrips() {
+        let value = json!({
+            "table": "ciso.rtprices",
+            "level": {
+                "level": 1,
+                "targetwindow_min": null,
+                "targetwindow_max": null,
+                "sourcewindow_min": null,
+                "sourcewindow_max": null,
+                "age_min": null,
+                "age_max": null,
+                "calendar_begin": "month"
+            },
+            "granularity": {"fixed": {"months": 0, "days": 0, "micros": 300000000}},
+            "begin": {"tz": "2026-01-01T08:00:00Z"},
+            "end": {"tz": "2026-02-01T08:00:00Z"},
+            "files": ["daily.parquet"],
+            "retries": 1,
+            "max_retries": 4
+        });
+        let job: Job<crate::lake::repack::RepackPayload> =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(job.retry.retries, Some(1));
+        assert!(matches!(
+            job.payload,
+            crate::lake::repack::RepackPayload::Maintenance(_)
+        ));
         assert_eq!(serde_json::to_value(job).unwrap(), value);
     }
 

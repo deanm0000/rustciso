@@ -8,9 +8,9 @@ pub mod repack;
 
 pub const SCHEMA: &str = "ciso";
 
-pub fn table_builder(table: &str) -> dkplus::TableBuilder {
+pub fn table_builder(cfg: &dkplus::Config, table: &str) -> dkplus::TableBuilder {
     let (schema, name) = table.split_once('.').unwrap_or((SCHEMA, table));
-    let builder = dkplus::Table::builder(schema, name);
+    let builder = dkplus::Table::builder(&format!("{schema}.{name}"), cfg);
     if schema == SCHEMA && REPORTS.iter().any(|report| report.name == name) {
         builder
     } else {
@@ -26,7 +26,7 @@ pub fn table_builder(table: &str) -> dkplus::TableBuilder {
 }
 
 pub async fn resolve_table(cfg: &dkplus::Config, table: &str) -> Result<dkplus::Table> {
-    table_builder(table).resolve(cfg).await
+    table_builder(cfg, table).resolve().await
 }
 
 pub async fn replace_window(
