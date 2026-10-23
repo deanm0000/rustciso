@@ -71,14 +71,11 @@ impl Job {
         if (self.repack_if_first == Some(true) && first)
             || (self.repack_if_last == Some(true) && last)
         {
-            Ok(Some(lake::repack::Job {
-                layout: lake::layout(report),
-                table: report.table(),
-                begin_date: date,
-                end_date: date.succ_opt().context("repack end date is out of range")?,
-                unique: Some(vec!["utcbegin".into(), "node".into()]),
-                files: None,
-            }))
+            Ok(Some(lake::repack::queued_job(
+                &report.table(),
+                date,
+                date.succ_opt().context("repack end date is out of range")?,
+            )))
         } else {
             Ok(None)
         }
@@ -112,9 +109,9 @@ async fn load_window(
         .context("pivoting csvs")?;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     log.push(format!("pivoted to {rows} rows"));
-    let r = lake::replace_window(&state.cfg, report.name, start, end, batches).await?;
+    let r = lake::replace_window(&state.cfg, &report.table(), batches).await?;
     log.push(format!(
-        "{}: snapshot {} added file {} {} ({} rows, {} bytes); retired files {:?} ({} rows){}",
+        "{}: snapshot {} added file {} {} ({} rows, {} bytes); retired files {:?} ({} rows); rewritten files {:?}",
         report.table(),
         r.snapshot_id,
         r.data_file_id,
@@ -123,9 +120,7 @@ async fn load_window(
         r.file_size_bytes,
         r.retired_files,
         r.retired_rows,
-        r.sql_deleted
-            .map(|n| format!("; pg_ducklake deleted {n} rows"))
-            .unwrap_or_default()
+        r.rewritten_files
     ));
     Ok(Outcome::Loaded)
 }
@@ -416,7 +411,7 @@ mod tests {
             assert_eq!(repack.is_some(), expected);
             if let Some(repack) = repack {
                 repack.validate().unwrap();
-                assert_eq!(repack.table, "ciso.daprices");
+                assert_eq!(repack.table.to_string(), "ciso.daprices");
                 assert_eq!(repack.begin_date.to_string(), "2026-11-01");
                 assert_eq!(repack.end_date.to_string(), "2026-11-02");
             }
@@ -475,12 +470,19 @@ mod tests {
                                         "table": report.table(),
                                         "begin_date": start.with_timezone(&Los_Angeles).date_naive().to_string(),
                                         "end_date": end.with_timezone(&Los_Angeles).date_naive().to_string(),
-                                        "unique": ["utcbegin", "node"],
                                     })
                                 );
                                 let decoded: lake::repack::Job =
                                     serde_json::from_value(payload).unwrap();
-                                decoded.validate().unwrap();
+                                assert_eq!(decoded.table.to_string(), report.table());
+                                assert_eq!(
+                                    decoded.begin_date,
+                                    start.with_timezone(&Los_Angeles).date_naive()
+                                );
+                                assert_eq!(
+                                    decoded.end_date,
+                                    end.with_timezone(&Los_Angeles).date_naive()
+                                );
                             }
                         }
                     }

@@ -34,8 +34,9 @@ February in leap years. This is still a file-statistics heuristic, not a check
 for exactly one file per distinct day or contiguous data.
 
 Each result produces one job on the existing
-[`repack` queue](../repack/README.md), with `"unique": ["utcbegin", "node"]`
-and `"files"` containing the catalog paths from `array_agg(path)`.
+[`repack` queue](../repack/README.md), with `"files"` containing the catalog
+paths from `array_agg(path)`. Deduplication and output layout are read from the three
+tables' DuckLake `dkplus.*` tags when the worker handles the job.
 The minimum's local date becomes `begin_date`; the day **after** the maximum's
 local date becomes the exclusive `end_date`, including the last day's rows.
 Los Angeles daylight-saving boundaries are handled by the repack worker.
@@ -44,8 +45,8 @@ Discovery finishes for all three tables before enqueueing starts.
 Database and queue failures fail the invocation and are included in its logs.
 A later timer invocation can still enqueue the same range while a previous job
 is pending, and a partial enqueue failure can leave some jobs already queued.
-The repack worker acquires per-table, per-local-date Postgres advisory locks
-for the requested range, then checks whether any supplied path is still active.
+The repack worker acquires per-table, per-UTC-date Postgres advisory locks
+covering the requested range, then checks whether any supplied path is still active.
 Overlapping ranges wait; disjoint ranges on the same table may run concurrently.
 If none of the supplied paths remain active, it
 logs a successful skip without sorting or rewriting the data. Source rechecks

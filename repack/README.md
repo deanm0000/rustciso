@@ -4,7 +4,9 @@
 
 The DuckLake catalog, Parquet writer, external sorting, and repack/fastpack
 implementation live in [`dkplus`](../../../modules/dkplus/README.md).
-This app retains the Azure trigger/queue contract and CISO layout/date policy.
+This app retains the Azure trigger/queue contract. Table policy for
+`ciso.rtprices`, `ciso.fmprices`, and `ciso.daprices` is resolved from their
+DuckLake `dkplus.*` tags; see the [dkplus tag settings](../../../modules/dkplus/README.md#catalog-configuration-and-operations).
 [`src/lake.rs`](../src/lake.rs) and
 [`src/lake/repack.rs`](../src/lake/repack.rs) are application adapters only.
 
@@ -23,8 +25,7 @@ Enqueue a base64-encoded JSON message on the `repack` Azure Storage queue
 {
   "table": "rtprices",
   "begin_date": "2026-01-01",
-  "end_date": "2026-10-01",
-  "unique": ["utcbegin", "node"]
+  "end_date": "2026-10-01"
 }
 ```
 
@@ -41,13 +42,15 @@ Failures retry after 60 seconds, incrementing `retries`; by default three retrie
 are allowed after the initial attempt. Exhausted jobs move to `repack-poison`
 with their payload intact and the failure reason logged.
 
-`unique` is an optional list of column names. When supplied, only rows within
-the requested interval are deduplicated by that combination of columns, keeping
-the entire row with the latest `downloaded_at`. Equal timestamps are broken by
-the highest DuckLake row ID; null timestamps sort behind non-null timestamps.
-Null key values compare equal. The list must be nonempty, contain distinct
-existing columns, and the table must have microsecond `timestamptz downloaded_at`.
-Omit `unique` or set it to `null` to preserve all rows without deduplication.
+`unique` is an optional list of column names that overrides the table's
+`dkplus.unique_by_cols` tag. When omitted or `null`, the table-tag policy is
+used. For the three CISO price tables this is configured in DuckLake, including
+the `downloaded_at` deduplication timestamp. When deduplication is enabled, only
+rows within the requested interval are deduplicated; the entire row with the
+latest timestamp is retained. Equal timestamps are broken by the highest
+DuckLake row ID, null timestamps sort behind non-null timestamps, and null key
+values compare equal. An explicit override must be nonempty, contain distinct
+existing columns, and the table must have the configured microsecond timestamp.
 
 `files` is an optional list of **catalog paths**, exactly as stored in
 `ducklake.ducklake_data_file.path` (not resolved blob URLs). For example:
@@ -67,13 +70,11 @@ are still selected for repacking.
 
 ## Output layout
 
-Layout is configured per [`Report`](../src/report.rs): `sort_cols` gives the
-ascending output order, and optional `row_group_col` keeps values together in
-row groups. All three price reports use `["node", "utcbegin"]` and `Some("node")`,
-preserving the behavior below. A row-group column must be `varchar` and the
-first sort column. With no row-group column, normal size targets apply without
-waiting for value boundaries. Manually named tables outside the report registry
-retain the existing price-table layout and schema requirements.
+The three price tables' `dkplus.sort_cols` and `dkplus.row_group_col` tags
+configure the ascending output order and node row grouping. A row-group column
+must be `varchar` and the first sort column. Manually named tables outside the
+report registry retain the existing price-table layout and schema requirements
+through explicit application defaults.
 
 - One nonempty Parquet file contains all live rows in the requested interval,
   sorted ascending by `(node, utcbegin)`, with ZSTD level 3 compression.
@@ -104,7 +105,8 @@ hour of that day, using its `repack_if_first` and `repack_if_last` flags.
 
 The [table maintenance timer](../maintenance/README.md) checks all three price
 tables every 30 minutes and enqueues eligible month-grouped ranges with
-`unique: ["utcbegin", "node"]` and the discovered `files` list.
+the discovered `files` list. Deduplication and output layout come from the
+table's dkplus tags.
 
 ## Azure runtime and failure behavior
 
@@ -174,27 +176,25 @@ No durable continuation/checkpoint is implemented; a retry starts sorting again.
 Jobs carrying `files` skip retries when their original files are no longer active.
 
 Every repack acquires one blocking, session-scoped Postgres advisory lock per
-Los Angeles calendar date in `[begin_date, end_date)` before reading the catalog.
-Locks are keyed by normalized schema/table name and local date
-(`rtprices` and `ciso.rtprices` share the same date locks). Overlapping ranges
-on a table wait for one another; disjoint ranges, including adjacent months,
-can run concurrently. Different tables can also run concurrently.
-Locks are acquired in chronological order to avoid deadlocks. DST days still
-require exactly one date lock, whether they contain 23, 24 or 25 hours.
-The same connection holds all locks through sorting,
-commit retries and cleanup, without keeping a transaction open during sorting.
-Normal returns, errors and disconnects release the locks when that connection
-closes, including partially acquired ranges. Waiting jobs check `files` only
-after acquiring all locks.
+UTC calendar date covered by the requested time range before reading the
+catalog. Locks are keyed by the table's lock namespace, schema/table name, and
+UTC date; the namespace defaults to the table name. Overlapping ranges on a
+table wait for one another; disjoint ranges can run concurrently. Different
+tables can also run concurrently. Locks are acquired in chronological order.
+The same connection holds all locks through sorting, commit retries and cleanup,
+without keeping a transaction open during sorting. Normal returns, errors and
+disconnects release the locks when that connection closes, including partially
+acquired ranges. Waiting jobs check `files` only after acquiring all locks.
 These locks coordinate repack workers, not ordinary ingestion writers;
 existing commit-time source/schema validation remains in place.
-Disjoint date ranges can still select the same boundary-straddling Parquet
-file; a conflicting publication fails the existing source recheck and retries.
-Each day consumes an advisory lock, so unusually long ranges may require
+Disjoint ranges can still select the same boundary-straddling Parquet file; a
+conflicting publication fails the existing source recheck and retries. Each
+UTC day consumes an advisory lock, so unusually long ranges may require
 Postgres lock-capacity tuning or smaller jobs.
 
-When deploying this change over the former table-wide locking implementation,
-drain running repacks first: old table keys and new date keys do not conflict.
+Los Angeles date ranges can cross UTC midnight, so a local-day job can acquire
+locks for two UTC dates. Adjacent local days still serialize if their UTC date
+sets overlap.
 
 Progress is written immediately to the handler console, rather than waiting for
 the invocation response: catalog checks, each source file, sorted runs, merge
@@ -226,8 +226,9 @@ with `varchar node` and microsecond `timestamptz utcbegin`. The shared library a
 supports boolean, signed/unsigned 8/16/32/64-bit integers, float32/float64,
 varchar, Date32 dates, and naive/aware microsecond timestamps as data columns.
 File columns must carry DuckLake Parquet field IDs. Null window/group keys
-are rejected. Other scrapers can configure their own columns, timezone and
-grouping policy in dkplus; this trigger preserves the existing CISO policy.
+are rejected. The three price-table settings are resolved from their DuckLake
+dkplus tags; other scrapers can configure their own columns, timezone and
+grouping policy in dkplus.
 
 Unencrypted, non-partial Parquet positional delete files are applied while
 streaming; their `pos` entries must be unique and ascending. In-range inlined

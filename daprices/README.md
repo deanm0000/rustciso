@@ -19,5 +19,6 @@ Enqueue messages on the `daprices` queue using the same format as
   Optional `retries` and `max_retries` follow the shared
   [retry policy](../rtprices/README.md#retry-policy-all-queue-triggers).
 - Every day is both the first and last window of its date, so either repack
-  flag queues a repack of that day with `table: "ciso.daprices"` and
-  `unique: ["utcbegin", "node"]`.
+  flag queues a repack of that day with `table: "ciso.daprices"`. Repack
+  deduplication and output layout are taken from the table's DuckLake dkplus
+  tags.

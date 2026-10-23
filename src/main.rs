@@ -61,13 +61,13 @@ async fn repack_handler(
     let job = req
         .map_err(|e| anyhow::anyhow!("{e}"))
         .and_then(|Json(r)| first_payload(r))
-        .and_then(|v| {
+        .and_then(|mut v| {
+            lake::repack::qualify_unqualified_table(&mut v);
             serde_json::from_value::<queue::Job<lake::repack::Job>>(v)
                 .context("payload must contain table, begin_date and end_date (YYYY-MM-DD)")
         })
-        .and_then(|mut job| {
-            job.payload.layout = lake::repack_layout(&job.payload.table);
-            job.payload.validate()?;
+        .and_then(|job| {
+            lake::repack::validate_request(&job.payload)?;
             Ok(job)
         });
     let job = match job {

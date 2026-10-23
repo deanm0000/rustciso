@@ -36,6 +36,7 @@ impl Config {
             },
             repack_run_bytes: self.repack_run_bytes,
             repack_node_bytes: self.repack_node_bytes,
+            log: std::sync::Arc::new(|message| eprintln!("{message}")),
         }
     }
 

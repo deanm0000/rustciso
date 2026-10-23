@@ -24,10 +24,6 @@ pub struct Report {
     pub window: Window,
     /// Time covered by one data point, independent of the download window.
     pub granularity: Duration,
-    /// Keep values of this column together in Parquet row groups, when set.
-    pub row_group_col: Option<&'static str>,
-    /// Ascending output ordering; the row-group column, if set, must be first.
-    pub sort_cols: &'static [&'static str],
     /// When OASIS is expected to have a window, relative to the window's start.
     pub ready_offset: Duration,
     pub not_ready_retry: std::time::Duration,
@@ -44,8 +40,6 @@ pub const RTPRICES: Report = Report {
     },
     window: Window::Hour,
     granularity: Duration::minutes(5),
-    row_group_col: Some("node"),
-    sort_cols: &["node", "utcbegin"],
     // Hour close plus a 5 minute grace period.
     ready_offset: Duration::minutes(65),
     not_ready_retry: std::time::Duration::from_secs(60),
@@ -62,8 +56,6 @@ pub const FMPRICES: Report = Report {
     },
     window: Window::Hour,
     granularity: Duration::minutes(15),
-    row_group_col: Some("node"),
-    sort_cols: &["node", "utcbegin"],
     ready_offset: Duration::minutes(65),
     not_ready_retry: std::time::Duration::from_secs(60),
 };
@@ -79,8 +71,6 @@ pub const DAPRICES: Report = Report {
     },
     window: Window::Day,
     granularity: Duration::hours(1),
-    row_group_col: Some("node"),
-    sort_cols: &["node", "utcbegin"],
     // DAM results post around 13:00 PT the day before; local midnight - 10h is 14:00 PT.
     ready_offset: Duration::hours(-10),
     not_ready_retry: std::time::Duration::from_secs(600),
@@ -209,11 +199,9 @@ mod tests {
     }
 
     #[test]
-    fn report_granularity_and_layout() {
+    fn report_granularity() {
         for (report, minutes) in [(&RTPRICES, 5), (&FMPRICES, 15), (&DAPRICES, 60)] {
             assert_eq!(report.granularity, Duration::minutes(minutes));
-            assert_eq!(report.row_group_col, Some("node"));
-            assert_eq!(report.sort_cols, &["node", "utcbegin"]);
         }
     }
 }

@@ -6,43 +6,37 @@ use crate::queue::QueueClient;
 use crate::report::{REPORTS, Report};
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
+use dkplus::Table;
 use dkplus::connect;
+use dkplus::repack::ExpireSnapshot;
 use std::time::Duration;
 use tokio_postgres::GenericClient;
 
-fn job(
-    report: &Report,
-    begin: NaiveDateTime,
-    end: NaiveDateTime,
-    files: Vec<String>,
-) -> Result<Job> {
-    let job = Job {
-        layout: super::layout(report),
-        table: report.table(),
-        begin_date: begin.date(),
-        // Catalog maxima are inclusive; repack dates are exclusive local midnights.
-        end_date: end
-            .date()
-            .succ_opt()
-            .context("maintenance end date is out of range")?,
-        unique: Some(vec!["utcbegin".into(), "node".into()]),
-        files: Some(files),
-    };
+fn job(table: &Table, begin: NaiveDateTime, end: NaiveDateTime, files: Vec<String>) -> Result<Job> {
+    // Catalog maxima are inclusive; repack dates are exclusive local midnights.
+    let job = table
+        .repack(
+            begin.date(),
+            end.date()
+                .succ_opt()
+                .context("maintenance end date is out of range")?,
+        )
+        .with_files(files)
+        .with_expire_snapshot(ExpireSnapshot::Never);
     job.validate()?;
     Ok(job)
 }
 
-async fn table_jobs(client: &impl GenericClient, report: &Report) -> Result<Vec<Job>> {
-    dkplus::maintenance::table_candidates(
-        client,
-        &super::layout(report),
-        report.name,
-        report.granularity,
-    )
-    .await?
-    .into_iter()
-    .map(|candidate| job(report, candidate.begin, candidate.end, candidate.files))
-    .collect()
+async fn table_jobs(
+    client: &impl GenericClient,
+    table: &Table,
+    report: &Report,
+) -> Result<Vec<Job>> {
+    dkplus::maintenance::table_candidates(client, table, report.granularity)
+        .await?
+        .into_iter()
+        .map(|candidate| job(table, candidate.begin, candidate.end, candidate.files))
+        .collect()
 }
 
 async fn enqueue(queue: &QueueClient, jobs: &[Job], log: &mut Vec<String>) -> Result<()> {
@@ -62,11 +56,13 @@ async fn enqueue(queue: &QueueClient, jobs: &[Job], log: &mut Vec<String>) -> Re
 }
 
 pub async fn run(cfg: &Config, queue: &QueueClient, log: &mut Vec<String>) -> Result<()> {
-    let mut client = connect(&cfg.lake()).await?;
+    let lake_config = cfg.lake();
+    let mut client = connect(&lake_config).await?;
     let mut jobs = Vec::new();
     for report in REPORTS {
+        let table = super::resolve_table(&lake_config, &report.table()).await?;
         let tx = client.transaction().await?;
-        let found = table_jobs(&tx, report).await?;
+        let found = table_jobs(&tx, &table, report).await?;
         log.push(format!(
             "{}: found {} maintenance ranges",
             report.table(),
@@ -103,7 +99,7 @@ mod tests {
                 ("2026-10-01T00:00:00", "2026-10-18T23:55:00", "2026-10-19"),
             ] {
                 let job = job(
-                    report,
+                    &unresolved_table(&report.table()),
                     begin.parse().unwrap(),
                     end.parse().unwrap(),
                     vec!["daily.parquet".into()],
@@ -115,7 +111,6 @@ mod tests {
                         "table": report.table(),
                         "begin_date": &begin[..10],
                         "end_date": exclusive,
-                        "unique": ["utcbegin", "node"],
                         "files": ["daily.parquet"]
                     })
                 );
@@ -144,21 +139,21 @@ mod tests {
     async fn enqueues_every_job_and_surfaces_queue_errors() {
         let jobs = [
             job(
-                &DAPRICES,
+                &unresolved_table(&DAPRICES.table()),
                 "2026-01-01T00:00:00".parse().unwrap(),
                 "2026-01-31T23:00:00".parse().unwrap(),
                 vec!["da-daily.parquet".into()],
             )
             .unwrap(),
             job(
-                &RTPRICES,
+                &unresolved_table(&RTPRICES.table()),
                 "2026-03-01T00:00:00".parse().unwrap(),
                 "2026-03-31T23:55:00".parse().unwrap(),
                 vec!["rt-daily.parquet".into()],
             )
             .unwrap(),
             job(
-                &FMPRICES,
+                &unresolved_table(&FMPRICES.table()),
                 "2026-11-01T00:00:00".parse().unwrap(),
                 "2026-11-30T23:45:00".parse().unwrap(),
                 vec!["fm-daily.parquet".into()],
@@ -199,7 +194,7 @@ mod tests {
                 .unwrap();
             let decoded = B64.decode(encoded).unwrap();
             let job: Job = serde_json::from_slice(&decoded).unwrap();
-            job.validate().unwrap();
+            assert!(job.begin_date < job.end_date);
             assert_eq!(
                 serde_json::to_value(job).unwrap(),
                 serde_json::to_value(expected).unwrap()
@@ -281,7 +276,9 @@ mod tests {
         ").await.unwrap();
         for report in REPORTS {
             let savepoint = tx.transaction().await.unwrap();
-            let jobs = table_jobs(&savepoint, report).await.unwrap();
+            let jobs = table_jobs(&savepoint, &unresolved_table(&report.table()), report)
+                .await
+                .unwrap();
             let hours = savepoint
                 .query(
                     "SELECT hours::double precision FROM pg_temp.maintenance_s1
@@ -322,7 +319,6 @@ mod tests {
                         "table": report.table(),
                         "begin_date": begin,
                         "end_date": end,
-                        "unique": ["utcbegin", "node"],
                         "files": job.files
                     })
                 );
@@ -332,5 +328,18 @@ mod tests {
         tx.rollback().await.unwrap();
         drop(client);
         connection.await.unwrap();
+    }
+
+    fn unresolved_table(name: &str) -> Table {
+        let (schema, table_name) = name.split_once('.').unwrap();
+        let mut table = Table::default();
+        table.schema = schema.into();
+        table.table = table_name.into();
+        table.time_column = "utcbegin".into();
+        table.timezone = chrono_tz::America::Los_Angeles;
+        table.row_group_col = Some("node".into());
+        table.sort_cols = vec!["node".into(), "utcbegin".into()];
+        table.dedup_timestamp = Some("downloaded_at".into());
+        table
     }
 }
