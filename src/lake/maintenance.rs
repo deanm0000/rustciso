@@ -2,18 +2,39 @@
 
 use crate::config::Config;
 use crate::queue::QueueClient;
-use crate::report::REPORTS;
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use dkplus::connect;
-use dkplus::maintenance::PotentialRepack;
+use dkplus::maintenance::{CleanupOptions, CleanupScope, PotentialRepack};
 use std::time::Duration;
-use tokio_postgres::GenericClient;
 
-async fn table_plans(
-    client: &impl GenericClient,
-    table: &dkplus::Table,
-) -> Result<Vec<PotentialRepack>> {
-    dkplus::maintenance::find_potential_repacks(client, table).await
+const TABLES_SQL: &str = "
+    SELECT s.schema_name, t.table_name
+    FROM ducklake.ducklake_table t
+    JOIN ducklake.ducklake_schema s USING (schema_id)
+    WHERE t.end_snapshot IS NULL AND s.end_snapshot IS NULL
+    ORDER BY s.schema_name, t.table_name";
+
+fn cleanup_options(now: DateTime<Utc>) -> CleanupOptions {
+    CleanupOptions {
+        scope: CleanupScope::Catalog,
+        older_than: now - chrono::Duration::hours(12),
+        dry_run: false,
+    }
+}
+
+pub async fn cleanup(cfg: &Config, log: &mut Vec<String>) -> Result<()> {
+    let report =
+        dkplus::maintenance::cleanup_expired_files(&cfg.lake(), &cleanup_options(Utc::now()))
+            .await
+            .context("cleaning up expired catalog files")?;
+    log.push(format!(
+        "expired-file cleanup: {} candidates, {} deleted, {} already missing",
+        report.files.len(),
+        report.deleted,
+        report.already_missing
+    ));
+    Ok(())
 }
 
 async fn enqueue(
@@ -38,24 +59,34 @@ async fn enqueue(
 
 pub async fn run(cfg: &Config, queue: &QueueClient, log: &mut Vec<String>) -> Result<()> {
     let lake_config = cfg.lake();
-    let mut client = connect(&lake_config).await?;
-    let mut plans = Vec::new();
-    for report in REPORTS {
-        let table = super::resolve_table(&lake_config, &report.table()).await?;
-        let tx = client.transaction().await?;
-        let found = table_plans(&tx, &table).await?;
+    let client = connect(&lake_config).await?;
+    let tables = client
+        .query(TABLES_SQL, &[])
+        .await
+        .context("listing active catalog tables")?;
+    drop(client);
+    let mut count = 0;
+    for row in tables {
+        let schema: String = row.try_get(0)?;
+        let name: String = row.try_get(1)?;
+        let table_name = format!("{schema}.{name}");
+        let table = lake_config
+            .table(&table_name)
+            .await
+            .with_context(|| format!("resolving maintenance table {table_name}"))?;
+        let plans = table
+            .find_potential_repacks()
+            .await
+            .with_context(|| format!("finding maintenance repacks for {table_name}"))?;
         log.push(format!(
             "{}: found {} maintenance repacks",
-            report.table(),
-            found.len()
+            table,
+            plans.len()
         ));
-        plans.extend(found);
-        tx.commit()
-            .await
-            .context("closing maintenance planning transaction")?;
+        enqueue(queue, &plans, log).await?;
+        count += plans.len();
     }
-    enqueue(queue, &plans, log).await?;
-    log.push(format!("maintenance queued {} repack jobs", plans.len()));
+    log.push(format!("maintenance queued {count} repack jobs"));
     Ok(())
 }
 
@@ -81,18 +112,56 @@ mod tests {
     }
 
     #[test]
-    fn timer_runs_every_thirty_minutes_without_startup_execution() {
+    fn planner_runs_hourly_at_ten_after_without_startup_execution() {
         let config: serde_json::Value =
-            serde_json::from_str(include_str!("../../maintenance/function.json")).unwrap();
+            serde_json::from_str(include_str!("../../planRepacks/function.json")).unwrap();
         assert_eq!(
             config["bindings"],
             json!([{
-                "name": "maintenance",
+                "name": "planRepacks",
                 "type": "timerTrigger",
                 "direction": "in",
-                "schedule": "0 */30 * * * *",
+                "schedule": "0 10 * * * *",
                 "runOnStartup": false,
                 "useMonitor": true
+            }])
+        );
+    }
+
+    #[test]
+    fn cleanup_runs_daily_at_eight_thirty_utc_with_twelve_hour_cutoff() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../../cleanupExpiredFiles/function.json")).unwrap();
+        assert_eq!(
+            config["bindings"],
+            json!([{
+                "name": "cleanupExpiredFiles",
+                "type": "timerTrigger",
+                "direction": "in",
+                "schedule": "0 30 8 * * *",
+                "runOnStartup": false,
+                "useMonitor": true
+            }])
+        );
+        let now = "2026-10-26T08:30:00Z".parse().unwrap();
+        let options = cleanup_options(now);
+        assert!(matches!(options.scope, CleanupScope::Catalog));
+        assert!(!options.dry_run);
+        assert_eq!(options.older_than, now - chrono::Duration::hours(12));
+    }
+
+    #[test]
+    fn maintenance_worker_uses_its_dedicated_queue() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../../maintenanceRepack/function.json")).unwrap();
+        assert_eq!(
+            config["bindings"],
+            json!([{
+                "name": "maintenanceRepack",
+                "type": "queueTrigger",
+                "direction": "in",
+                "queueName": "maintenance-repack",
+                "connection": "AzureWebJobsStorage"
             }])
         );
     }
@@ -123,7 +192,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
         let app = Router::new().route(
-            "/repack/messages",
+            "/maintenance-repack/messages",
             post(move |uri: axum::http::Uri, body: String| {
                 let send = send.clone();
                 async move {
@@ -138,7 +207,11 @@ mod tests {
             key: B64.encode("key"),
             queue_endpoint: format!("http://{address}"),
         };
-        let queue = QueueClient::new(reqwest::Client::new(), account.clone(), "repack");
+        let queue = QueueClient::new(
+            reqwest::Client::new(),
+            account.clone(),
+            crate::MAINTENANCE_REPACK_QUEUE_NAME,
+        );
         let mut log = Vec::new();
         enqueue(&queue, &[], &mut log).await.unwrap();
         assert!(receive.try_recv().is_err());

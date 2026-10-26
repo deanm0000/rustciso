@@ -194,6 +194,8 @@ mod tests {
                 "sourcewindow_max": null,
                 "age_min": null,
                 "age_max": null,
+                "relage_min": null,
+                "relage_max": null,
                 "calendar_begin": "month"
             },
             "granularity": {"fixed": {"months": 0, "days": 0, "micros": 300000000}},

@@ -1,0 +1,12 @@
+{
+  "bindings": [
+    {
+      "name": "planRepacks",
+      "type": "timerTrigger",
+      "direction": "in",
+      "schedule": "0 10 * * * *",
+      "runOnStartup": false,
+      "useMonitor": true
+    }
+  ]
+}

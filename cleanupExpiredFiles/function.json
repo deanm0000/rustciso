@@ -1,10 +1,10 @@
 {
   "bindings": [
     {
-      "name": "maintenance",
+      "name": "cleanupExpiredFiles",
       "type": "timerTrigger",
       "direction": "in",
-      "schedule": "0 */30 * * * *",
+      "schedule": "0 30 8 * * *",
       "runOnStartup": false,
       "useMonitor": true
     }

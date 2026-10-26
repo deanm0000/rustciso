@@ -39,10 +39,11 @@ range `2026-01-01` through `2026-10-01` becomes
 `[2026-01-01T08:00:00Z, 2026-10-01T07:00:00Z)`. A local day spanning a
 daylight-saving transition can contain 23 or 25 hours.
 
-The maintenance timer sends serialized `dkplus::maintenance::PotentialRepack`
-plans on this same queue. These include the rule level, granularity, bounds,
-and source paths. The worker rechecks each plan against current catalog
-statistics before repacking; stale plans are logged and skipped.
+The [catalog planner](../planRepacks/README.md) now sends maintenance plans to
+the dedicated [maintenance worker](../maintenanceRepack/README.md), not this
+queue. Previously queued `dkplus::maintenance::PotentialRepack` messages remain
+supported here for rollout compatibility. Their table policy is resolved from
+catalog tags, and stale plans are logged and skipped.
 
 Optional `retries` and `max_retries` use the shared
 [queue retry policy](../rtprices/README.md#retry-policy-all-queue-triggers).
@@ -111,10 +112,9 @@ The [hourly RT prices trigger](../rtprices/README.md) can also enqueue a
 single-day repack after successfully processing the first or last Los Angeles
 hour of that day, using its `repack_if_first` and `repack_if_last` flags.
 
-The [table maintenance timer](../maintenance/README.md) checks all three price
-tables every 30 minutes and enqueues eligible month-grouped ranges with
-the discovered `files` list. Deduplication and output layout come from the
-table's dkplus tags.
+The [catalog maintenance planner](../planRepacks/README.md) checks active catalog
+tables hourly at minute 10 and enqueues tag-driven plans to its dedicated worker.
+Deduplication and output layout come from each table's dkplus tags.
 
 ## Azure runtime and failure behavior
 

@@ -128,10 +128,11 @@ pub fn validate_plan(plan: &PotentialRepack) -> Result<()> {
         .table
         .split_once('.')
         .ok_or_else(|| anyhow::anyhow!("maintenance table must be schema-qualified"))?;
-    if [schema, name].iter().any(|part| {
-        part.is_empty() || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    }) {
-        bail!("table components must use letters, digits and underscores");
+    if [schema, name]
+        .iter()
+        .any(|part| part.is_empty() || part.contains(['\0', '.']))
+    {
+        bail!("maintenance table components must be nonempty and contain no NUL or dot");
     }
     if plan.begin.utc() >= plan.end.utc() {
         bail!("begin must precede end (exclusive)");
@@ -170,7 +171,7 @@ pub async fn run(cfg: &Config, payload: &RepackPayload, log: &mut Vec<String>) -
                 job.run().await
             }
             RepackPayload::Maintenance(plan) => {
-                let table = super::resolve_table(&lake_config, &plan.table).await?;
+                let table = lake_config.table(&plan.table).await?;
                 match dkplus::maintenance::do_repack(&table, plan, Strictness::Raise).await? {
                     dkplus::maintenance::RepackOutcome::Repacked => {
                         log.push(format!("maintenance repack completed for {}", plan.table));
