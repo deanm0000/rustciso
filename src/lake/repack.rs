@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::logging::InvocationLog;
 use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
 use chrono_tz::America::Los_Angeles;
@@ -151,24 +152,15 @@ pub fn validate_plan(plan: &PotentialRepack) -> Result<()> {
     Ok(())
 }
 
-pub async fn run(cfg: &Config, payload: &RepackPayload, log: &mut Vec<String>) -> Result<()> {
-    let library_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let captured_log = library_log.clone();
-    let mut lake_config = cfg.lake();
-    lake_config.log = std::sync::Arc::new(move |message| {
-        eprintln!("{message}");
-        match captured_log.lock() {
-            Ok(mut messages) => messages.push(message.to_owned()),
-            Err(error) => eprintln!("could not capture dkplus log message: {error}"),
-        }
-    });
-    let result = async {
+pub async fn run(cfg: &Config, payload: &RepackPayload, log: &InvocationLog) -> Result<()> {
+    let lake_config = cfg.lake(log.clone());
+    let result: Result<()> = async {
         match payload {
             RepackPayload::Job(job) => {
                 let mut job = job.clone();
                 job.table = super::resolve_table(&lake_config, &job.table.to_string()).await?;
                 job.validate()?;
-                job.run().await
+                Ok(job.run().await?)
             }
             RepackPayload::Maintenance(plan) => {
                 let table = lake_config.table(&plan.table).await?;
@@ -189,10 +181,6 @@ pub async fn run(cfg: &Config, payload: &RepackPayload, log: &mut Vec<String>) -
         }
     }
     .await;
-    match library_log.lock() {
-        Ok(mut messages) => log.append(&mut messages),
-        Err(error) => eprintln!("could not collect dkplus logs: {error}"),
-    }
     result
 }
 

@@ -1,4 +1,5 @@
 //! CISO table-policy resolution and adapters for the reusable dkplus library.
+use crate::logging::InvocationLog;
 use crate::{config::Config, report::REPORTS};
 use anyhow::Result;
 use datafusion::arrow::array::RecordBatch;
@@ -26,16 +27,17 @@ pub fn table_builder(cfg: &dkplus::Config, table: &str) -> dkplus::TableBuilder 
 }
 
 pub async fn resolve_table(cfg: &dkplus::Config, table: &str) -> Result<dkplus::Table> {
-    table_builder(cfg, table).resolve().await
+    Ok(table_builder(cfg, table).resolve().await?)
 }
 
 pub async fn replace_window(
     cfg: &Config,
     table: &str,
     batches: Vec<RecordBatch>,
+    log: &InvocationLog,
 ) -> Result<dkplus::LoadReport> {
-    resolve_table(&cfg.lake(), table)
+    Ok(resolve_table(&cfg.lake(log.clone()), table)
         .await?
         .replace_window(batches)
-        .await
+        .await?)
 }

@@ -1,4 +1,5 @@
 use crate::config::StorageAccount;
+use crate::logging::InvocationLog;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -259,16 +260,10 @@ mod tests {
         );
         let mut job = json!({"startdatetime": "20230709T07:00-0000", "get_prev_until": "20200101T08:00-0000"});
         let mut retry = RetryState::default();
-        let mut log = Vec::new();
+        let log = InvocationLog::default();
         for count in 1..=3 {
             queue
-                .retry_or_poison(
-                    &job,
-                    retry,
-                    Duration::from_secs(60),
-                    "test failure",
-                    &mut log,
-                )
+                .retry_or_poison(&job, retry, Duration::from_secs(60), "test failure", &log)
                 .await
                 .unwrap();
             let sent = requests.lock().unwrap();
@@ -289,13 +284,7 @@ mod tests {
             retry = serde_json::from_value(job.clone()).unwrap();
         }
         queue
-            .retry_or_poison(
-                &job,
-                retry,
-                Duration::from_secs(60),
-                "test failure",
-                &mut log,
-            )
+            .retry_or_poison(&job, retry, Duration::from_secs(60), "test failure", &log)
             .await
             .unwrap();
         {
@@ -316,7 +305,7 @@ mod tests {
                 job
             );
         }
-        assert!(log.last().unwrap().contains("daprices-poison"));
+        assert!(log.lines().last().unwrap().contains("daprices-poison"));
         let no_retry = json!({"table": "x", "max_retries": 0});
         queue
             .retry_or_poison(
@@ -327,7 +316,7 @@ mod tests {
                 },
                 Duration::ZERO,
                 "no retries allowed",
-                &mut log,
+                &log,
             )
             .await
             .unwrap();
@@ -346,7 +335,7 @@ mod tests {
             };
             assert!(
                 queue
-                    .retry_or_poison(&job, retry, Duration::ZERO, "failure", &mut log)
+                    .retry_or_poison(&job, retry, Duration::ZERO, "failure", &log)
                     .await
                     .is_err()
             );
@@ -370,7 +359,7 @@ impl QueueClient {
         retry: RetryState,
         visibility: Duration,
         reason: &str,
-        log: &mut Vec<String>,
+        log: &InvocationLog,
     ) -> Result<()> {
         if let Some(next) = retry.next() {
             let mut payload = serde_json::to_value(job)?;

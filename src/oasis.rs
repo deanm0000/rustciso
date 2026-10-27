@@ -1,3 +1,4 @@
+use crate::logging::InvocationLog;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -27,7 +28,9 @@ impl std::error::Error for ProcessingError {}
 
 pub fn parse_oasis_time(s: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_str(s.trim(), OASIS_FMT)
-        .with_context(|| format!("invalid OASIS datetime '{s}', expected e.g. 20261016T07:00-0000"))?
+        .with_context(|| {
+            format!("invalid OASIS datetime '{s}', expected e.g. 20261016T07:00-0000")
+        })?
         .with_timezone(&Utc))
 }
 
@@ -69,13 +72,17 @@ pub async fn fetch(
     query: &OasisQuery,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-    log: &mut Vec<String>,
+    log: &InvocationLog,
 ) -> Result<OasisResult> {
     let url = build_url(query, start, end);
     fetch_url(client, &url, log).await
 }
 
-async fn fetch_url(client: &reqwest::Client, url: &str, log: &mut Vec<String>) -> Result<OasisResult> {
+async fn fetch_url(
+    client: &reqwest::Client,
+    url: &str,
+    log: &InvocationLog,
+) -> Result<OasisResult> {
     let mut attempt = 0;
     let mut body = fetch_body(client, url, log, &mut attempt).await?;
     let mut deadline = None;
@@ -84,8 +91,11 @@ async fn fetch_url(client: &reqwest::Client, url: &str, log: &mut Vec<String>) -
             Err(err) if err.is::<ProcessingError>() => err,
             result => return result,
         };
-        let deadline = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + PROCESSING_TIMEOUT);
-        log.push(format!("{processing}; waiting {PROCESSING_WAIT:?} before retry (60s limit)"));
+        let deadline =
+            *deadline.get_or_insert_with(|| tokio::time::Instant::now() + PROCESSING_TIMEOUT);
+        log.push(format!(
+            "{processing}; waiting {PROCESSING_WAIT:?} before retry (60s limit)"
+        ));
         body = tokio::time::timeout_at(deadline, async {
             tokio::time::sleep(PROCESSING_WAIT).await;
             fetch_body(client, url, log, &mut attempt).await
@@ -98,16 +108,22 @@ async fn fetch_url(client: &reqwest::Client, url: &str, log: &mut Vec<String>) -
 async fn fetch_body(
     client: &reqwest::Client,
     url: &str,
-    log: &mut Vec<String>,
+    log: &InvocationLog,
     attempt: &mut usize,
 ) -> Result<Bytes> {
     let body = loop {
         log.push(format!("GET {url}"));
-        let resp = client.get(url).send().await.context("OASIS request failed")?;
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .context("OASIS request failed")?;
         let status = resp.status();
         if status == StatusCode::TOO_MANY_REQUESTS && *attempt < RATE_LIMIT_RETRIES {
             *attempt += 1;
-            log.push(format!("OASIS 429, waiting {RATE_LIMIT_WAIT:?} (retry {attempt}/{RATE_LIMIT_RETRIES})"));
+            log.push(format!(
+                "OASIS 429, waiting {RATE_LIMIT_WAIT:?} (retry {attempt}/{RATE_LIMIT_RETRIES})"
+            ));
             tokio::time::sleep(RATE_LIMIT_WAIT).await;
             continue;
         }
@@ -120,7 +136,8 @@ async fn fetch_body(
 }
 
 pub fn parse_zip(body: &[u8]) -> Result<OasisResult> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(body)).context("OASIS response is not a zip")?;
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(body)).context("OASIS response is not a zip")?;
     let mut csvs = Vec::new();
     let mut xml_errors = Vec::new();
     for i in 0..archive.len() {
@@ -140,7 +157,9 @@ pub fn parse_zip(body: &[u8]) -> Result<OasisResult> {
     }
     match xml_errors.into_iter().next() {
         Some((Some(code), desc)) if code == NO_DATA_ERR_CODE => Ok(OasisResult::NotReady(desc)),
-        Some((Some(code), desc)) if code == PROCESSING_ERR_CODE => Err(ProcessingError(desc).into()),
+        Some((Some(code), desc)) if code == PROCESSING_ERR_CODE => {
+            Err(ProcessingError(desc).into())
+        }
         Some((code, desc)) => Err(anyhow!("OASIS error {}: {desc}", code.unwrap_or_default())),
         None => Err(anyhow!("OASIS zip contained no csv or xml files")),
     }
@@ -157,7 +176,9 @@ fn tag_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 fn parse_xml_error(xml: &str) -> (Option<String>, String) {
     (
         tag_text(xml, "ERR_CODE").map(str::to_string),
-        tag_text(xml, "ERR_DESC").unwrap_or("unknown OASIS error").to_string(),
+        tag_text(xml, "ERR_DESC")
+            .unwrap_or("unknown OASIS error")
+            .to_string(),
     )
 }
 
@@ -165,7 +186,10 @@ fn parse_xml_error(xml: &str) -> (Option<String>, String) {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     const NO_DATA_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <m:OASISReport xmlns:m="http://www.caiso.com/soa/OASISReport_v1.xsd">
@@ -176,12 +200,13 @@ mod tests {
 </m:ERROR></m:RTO></m:MessagePayload></m:OASISReport>"#;
 
     fn processing_zip() -> Vec<u8> {
-        zip_of(&[("error.xml", &NO_DATA_XML
-            .replace(">1000<", ">1015<")
-            .replace(
+        zip_of(&[(
+            "error.xml",
+            &NO_DATA_XML.replace(">1000<", ">1015<").replace(
                 "No data returned for the specified selection",
                 "GroupZip DownLoad is in Processing, Please Submit request after Sometime",
-            ))])
+            ),
+        )])
     }
 
     struct TestServer {
@@ -199,21 +224,31 @@ mod tests {
     async fn serve(responses: Vec<Vec<u8>>) -> TestServer {
         let requests = Arc::new(AtomicUsize::new(0));
         let count = requests.clone();
-        let app = axum::Router::new().route("/", axum::routing::get(move || {
-            let index = count.fetch_add(1, Ordering::SeqCst).min(responses.len() - 1);
-            let body = responses[index].clone();
-            async move { body }
-        }));
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let index = count
+                    .fetch_add(1, Ordering::SeqCst)
+                    .min(responses.len() - 1);
+                let body = responses[index].clone();
+                async move { body }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        TestServer { url, requests, task }
+        TestServer {
+            url,
+            requests,
+            task,
+        }
     }
 
     fn zip_of(files: &[(&str, &str)]) -> Vec<u8> {
         let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
         for (name, body) in files {
-            w.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            w.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
             w.write_all(body.as_bytes()).unwrap();
         }
         w.finish().unwrap().into_inner()
@@ -247,33 +282,54 @@ mod tests {
     fn detects_processing_inside_zip() {
         let err = parse_zip(&processing_zip()).unwrap_err();
         assert!(err.is::<ProcessingError>());
-        assert!(err.to_string().contains("GroupZip DownLoad is in Processing"));
+        assert!(
+            err.to_string()
+                .contains("GroupZip DownLoad is in Processing")
+        );
     }
 
     #[tokio::test]
     async fn retries_processing_until_csvs_are_ready() {
-        let server = serve(vec![processing_zip(), processing_zip(), zip_of(&[("a.csv", "h\n1\n")])]).await;
-        let mut log = Vec::new();
+        let server = serve(vec![
+            processing_zip(),
+            processing_zip(),
+            zip_of(&[("a.csv", "h\n1\n")]),
+        ])
+        .await;
+        let log = InvocationLog::default();
         let started = tokio::time::Instant::now();
-        let result = fetch_url(&reqwest::Client::new(), &server.url, &mut log).await.unwrap();
+        let result = fetch_url(&reqwest::Client::new(), &server.url, &log)
+            .await
+            .unwrap();
         assert!(matches!(result, OasisResult::Csvs(csvs) if csvs.len() == 1));
         assert_eq!(server.requests.load(Ordering::SeqCst), 3);
         assert!(started.elapsed() >= PROCESSING_WAIT * 2);
-        assert_eq!(log.iter().filter(|line| line.contains("waiting 5s")).count(), 2);
+        assert_eq!(
+            log.lines()
+                .iter()
+                .filter(|line| line.contains("waiting 5s"))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
     async fn stops_processing_retries_after_one_minute() {
         let server = serve(vec![processing_zip()]).await;
-        let mut log = Vec::new();
+        let log = InvocationLog::default();
         let started = tokio::time::Instant::now();
-        let err = fetch_url(&reqwest::Client::new(), &server.url, &mut log).await.unwrap_err();
+        let err = fetch_url(&reqwest::Client::new(), &server.url, &log)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("still processing after 60s"));
         assert!(err.to_string().contains("1015"));
         assert!(started.elapsed() >= PROCESSING_TIMEOUT);
         assert!(started.elapsed() < PROCESSING_TIMEOUT + PROCESSING_WAIT);
         let requests = server.requests.load(Ordering::SeqCst);
-        assert!((2..=13).contains(&requests), "unexpected request count: {requests}");
+        assert!(
+            (2..=13).contains(&requests),
+            "unexpected request count: {requests}"
+        );
     }
 
     #[tokio::test]
@@ -283,7 +339,12 @@ mod tests {
             (NO_DATA_XML.replace(">1000<", ">9999<"), false),
         ] {
             let server = serve(vec![zip_of(&[("error.xml", &xml)])]).await;
-            let result = fetch_url(&reqwest::Client::new(), &server.url, &mut Vec::new()).await;
+            let result = fetch_url(
+                &reqwest::Client::new(),
+                &server.url,
+                &InvocationLog::default(),
+            )
+            .await;
             if not_ready {
                 assert!(matches!(result.unwrap(), OasisResult::NotReady(_)));
             } else {

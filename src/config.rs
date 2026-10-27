@@ -1,3 +1,4 @@
+use crate::logging::{InvocationLog, write_startup};
 use anyhow::{Context, Result, anyhow};
 use dkplus::config::{DEFAULT_REPACK_NODE_BYTES, DEFAULT_REPACK_RUN_BYTES};
 use std::collections::HashMap;
@@ -27,7 +28,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn lake(&self) -> dkplus::Config {
+    pub fn lake(&self, log: InvocationLog) -> dkplus::Config {
         dkplus::Config {
             postgres: self.postgres.clone(),
             storage: dkplus::Storage::Azure {
@@ -36,7 +37,7 @@ impl Config {
             },
             repack_run_bytes: self.repack_run_bytes,
             repack_node_bytes: self.repack_node_bytes,
-            log: std::sync::Arc::new(|message| eprintln!("{message}")),
+            log: std::sync::Arc::new(move |message| log.push(message)),
         }
     }
 
@@ -73,19 +74,19 @@ fn env_mb(name: &str, default: usize) -> usize {
         Ok(value) => match parse_mb(&value) {
             Some(bytes) => bytes,
             None => {
-                eprintln!(
+                write_startup(format!(
                     "{name} must be a positive whole MiB count that fits in bytes; using default {} MiB",
                     default / (1024 * 1024)
-                );
+                ));
                 default
             }
         },
         Err(env::VarError::NotPresent) => default,
         Err(error) => {
-            eprintln!(
+            write_startup(format!(
                 "could not read {name} ({error}); using default {} MiB",
                 default / (1024 * 1024)
-            );
+            ));
             default
         }
     }

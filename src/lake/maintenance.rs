@@ -1,6 +1,7 @@
 //! Finds dkplus maintenance plans and delivers them to the repack worker.
 
 use crate::config::Config;
+use crate::logging::InvocationLog;
 use crate::queue::QueueClient;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -23,11 +24,13 @@ fn cleanup_options(now: DateTime<Utc>) -> CleanupOptions {
     }
 }
 
-pub async fn cleanup(cfg: &Config, log: &mut Vec<String>) -> Result<()> {
-    let report =
-        dkplus::maintenance::cleanup_expired_files(&cfg.lake(), &cleanup_options(Utc::now()))
-            .await
-            .context("cleaning up expired catalog files")?;
+pub async fn cleanup(cfg: &Config, log: &InvocationLog) -> Result<()> {
+    let report = dkplus::maintenance::cleanup_expired_files(
+        &cfg.lake(log.clone()),
+        &cleanup_options(Utc::now()),
+    )
+    .await
+    .context("cleaning up expired catalog files")?;
     log.push(format!(
         "expired-file cleanup: {} candidates, {} deleted, {} already missing",
         report.files.len(),
@@ -40,25 +43,40 @@ pub async fn cleanup(cfg: &Config, log: &mut Vec<String>) -> Result<()> {
 async fn enqueue(
     queue: &QueueClient,
     plans: &[PotentialRepack],
-    log: &mut Vec<String>,
+    log: &InvocationLog,
 ) -> Result<()> {
     for plan in plans {
+        let plan_json = serde_json::to_string(plan)?;
         queue
-            .send(&serde_json::to_string(plan)?, Duration::ZERO)
+            .send(&plan_json, Duration::ZERO)
             .await
-            .with_context(|| format!("enqueueing maintenance repack {plan:?}"))?;
+            .with_context(|| format!("enqueueing maintenance repack {plan_json}"))?;
         let message = format!(
             "queued maintenance repack of {} [{}, {})",
             plan.table, plan.begin, plan.end
         );
-        eprintln!("{message}");
         log.push(message);
     }
     Ok(())
 }
 
-pub async fn run(cfg: &Config, queue: &QueueClient, log: &mut Vec<String>) -> Result<()> {
-    let lake_config = cfg.lake();
+fn skip_missing_settings<T>(
+    result: dkplus::Result<T>,
+    log: &InvocationLog,
+) -> dkplus::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error @ dkplus::Error::MissingRequiredSetting { .. }) => {
+            let message = format!("skipping maintenance table: {error}");
+            log.push(message);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub async fn run(cfg: &Config, queue: &QueueClient, log: &InvocationLog) -> Result<()> {
+    let lake_config = cfg.lake(log.clone());
     let client = connect(&lake_config).await?;
     let tables = client
         .query(TABLES_SQL, &[])
@@ -70,14 +88,16 @@ pub async fn run(cfg: &Config, queue: &QueueClient, log: &mut Vec<String>) -> Re
         let schema: String = row.try_get(0)?;
         let name: String = row.try_get(1)?;
         let table_name = format!("{schema}.{name}");
-        let table = lake_config
-            .table(&table_name)
-            .await
-            .with_context(|| format!("resolving maintenance table {table_name}"))?;
-        let plans = table
-            .find_potential_repacks()
-            .await
-            .with_context(|| format!("finding maintenance repacks for {table_name}"))?;
+        let Some(table) = skip_missing_settings(lake_config.table(&table_name).await, log)
+            .with_context(|| format!("resolving maintenance table {table_name}"))?
+        else {
+            continue;
+        };
+        let Some(plans) = skip_missing_settings(table.find_potential_repacks().await, log)
+            .with_context(|| format!("finding maintenance repacks for {table_name}"))?
+        else {
+            continue;
+        };
         log.push(format!(
             "{}: found {} maintenance repacks",
             table,
@@ -108,6 +128,60 @@ mod tests {
             begin: Bound::Tz(begin.parse().unwrap()),
             end: Bound::Tz(end.parse().unwrap()),
             files: vec![file.into()],
+        }
+    }
+
+    #[test]
+    fn missing_settings_are_logged_and_skipped() {
+        for setting in ["time_column", "timezone", "sort_cols", "granularity"] {
+            let log = InvocationLog::default();
+            let result = skip_missing_settings::<()>(
+                Err(dkplus::Error::MissingRequiredSetting {
+                    table: "abb.energy".into(),
+                    setting,
+                }),
+                &log,
+            )
+            .unwrap();
+            assert_eq!(result, None);
+            assert!(log.lines()[0].contains(&format!(
+                "skipping maintenance table: abb.energy: missing required setting {setting}"
+            )));
+            assert_eq!(skip_missing_settings(Ok(42), &log).unwrap(), Some(42));
+            assert_eq!(log.lines().len(), 1);
+        }
+    }
+
+    #[test]
+    fn other_errors_remain_failures_with_context() {
+        let errors = [
+            dkplus::Error::InvalidConfiguration {
+                table: "abb.energy".into(),
+                reason: "configured time column does not exist".into(),
+            },
+            dkplus::Error::InvalidData {
+                reason: "missing required statistics".into(),
+            },
+            dkplus::Error::Io {
+                operation: "connecting to catalog".into(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "connection refused",
+                ),
+            },
+        ];
+        for error in errors {
+            let expected = error.to_string();
+            let log = InvocationLog::default();
+            let error = skip_missing_settings::<()>(Err(error), &log)
+                .context("resolving maintenance table abb.energy")
+                .unwrap_err();
+            assert!(log.lines().is_empty());
+            assert_eq!(error.to_string(), "resolving maintenance table abb.energy");
+            assert_eq!(
+                error.downcast_ref::<dkplus::Error>().unwrap().to_string(),
+                expected
+            );
         }
     }
 
@@ -212,10 +286,10 @@ mod tests {
             account.clone(),
             crate::MAINTENANCE_REPACK_QUEUE_NAME,
         );
-        let mut log = Vec::new();
-        enqueue(&queue, &[], &mut log).await.unwrap();
+        let log = InvocationLog::default();
+        enqueue(&queue, &[], &log).await.unwrap();
         assert!(receive.try_recv().is_err());
-        enqueue(&queue, &plans, &mut log).await.unwrap();
+        enqueue(&queue, &plans, &log).await.unwrap();
         for expected in &plans {
             let (uri, body) = receive.try_recv().unwrap();
             assert_eq!(uri.query(), Some("messagettl=-1&visibilitytimeout=0"));
@@ -235,12 +309,12 @@ mod tests {
                 serde_json::to_value(expected).unwrap()
             );
         }
-        assert_eq!(log.len(), plans.len());
+        assert_eq!(log.lines().len(), plans.len());
         assert!(receive.try_recv().is_err());
         let failed_queue = QueueClient::new(reqwest::Client::new(), account, "missing");
-        let error = enqueue(&failed_queue, &plans, &mut log).await.unwrap_err();
+        let error = enqueue(&failed_queue, &plans, &log).await.unwrap_err();
         assert!(format!("{error:#}").contains("HTTP 404"));
-        assert_eq!(log.len(), plans.len());
+        assert_eq!(log.lines().len(), plans.len());
         server.abort();
     }
 }

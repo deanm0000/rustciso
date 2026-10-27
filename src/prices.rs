@@ -1,6 +1,7 @@
 //! Shared queue-triggered loader for the OASIS LMP price tables (see `report::REPORTS`).
 
 use crate::azure::{FuncRequest, first_payload};
+use crate::logging::InvocationLog;
 use crate::oasis::{self, OasisResult};
 use crate::report::{Report, local_date};
 use crate::{AppState, HandlerResponse, lake, queue, respond, transform};
@@ -91,7 +92,7 @@ async fn load_window(
     state: &AppState,
     report: &Report,
     start: DateTime<Utc>,
-    log: &mut Vec<String>,
+    log: &InvocationLog,
 ) -> Result<Outcome> {
     let end = report.window_end(start)?;
     let csvs = match oasis::fetch(&state.http, &report.query, start, end, log).await? {
@@ -109,18 +110,18 @@ async fn load_window(
         .context("pivoting csvs")?;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     log.push(format!("pivoted to {rows} rows"));
-    let r = lake::replace_window(&state.cfg, &report.table(), batches).await?;
+    let r = lake::replace_window(&state.cfg, &report.table(), batches, log).await?;
     log.push(format!(
-        "{}: snapshot {} added file {} {} ({} rows, {} bytes); retired files {:?} ({} rows); rewritten files {:?}",
+        "{}: snapshot {} added file {} {} ({} rows, {} bytes); retired files {} ({} rows); rewritten files {}",
         report.table(),
         r.snapshot_id,
         r.data_file_id,
         r.path,
         r.rows,
         r.file_size_bytes,
-        r.retired_files,
+        serde_json::to_string(&r.retired_files)?,
         r.retired_rows,
-        r.rewritten_files
+        serde_json::to_string(&r.rewritten_files)?
     ));
     Ok(Outcome::Loaded)
 }
@@ -143,7 +144,7 @@ async fn enqueue(
     job: &Job,
     delay: std::time::Duration,
     what: &str,
-    log: &mut Vec<String>,
+    log: &InvocationLog,
 ) -> Result<()> {
     state
         .queue(report)?
@@ -157,7 +158,7 @@ async fn enqueue(
     Ok(())
 }
 
-async fn handle(state: &AppState, report: &Report, job: Job, log: &mut Vec<String>) -> Result<()> {
+async fn handle(state: &AppState, report: &Report, job: Job, log: &InvocationLog) -> Result<()> {
     let start = oasis::parse_oasis_time(&job.startdatetime)?;
     let continuations = job.continuations(report, start)?;
     let repack = job.repack(report, start)?;
@@ -248,7 +249,11 @@ pub async fn handler(
     report: &'static Report,
     req: Result<Json<FuncRequest>, JsonRejection>,
 ) -> HandlerResponse {
-    let mut log = Vec::new();
+    let log = InvocationLog::new(
+        req.as_ref()
+            .ok()
+            .and_then(|Json(request)| crate::azure::request_id(request)),
+    );
     let job = match parse_job(report, req) {
         Ok(j) => j,
         Err(e) => {
@@ -256,8 +261,17 @@ pub async fn handler(
             return respond(StatusCode::BAD_REQUEST, log);
         }
     };
-    log.push(format!("{} job {job:?}", report.name));
-    match handle(&state, report, job, &mut log).await {
+    match InvocationLog::json(&format!("{} job", report.name), &job) {
+        Ok(message) => log.push(message),
+        Err(error) => {
+            log.push(format!(
+                "failed to serialize {} job for logging: {error:#}",
+                report.name
+            ));
+            return respond(StatusCode::INTERNAL_SERVER_ERROR, log);
+        }
+    }
+    match handle(&state, report, job, &log).await {
         Ok(()) => respond(StatusCode::OK, log),
         Err(e) => {
             // Couldn't write to the queue: fail so the Functions host redelivers the original.

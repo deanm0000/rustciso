@@ -1,14 +1,16 @@
 mod azure;
 mod config;
 mod lake;
+mod logging;
 mod oasis;
 mod prices;
 mod queue;
 mod report;
 mod transform;
 
-use crate::azure::{FuncRequest, OutResponse, first_payload};
+use crate::azure::{FuncRequest, OutResponse, first_payload, request_id};
 use crate::config::Config;
+use crate::logging::InvocationLog;
 use crate::queue::QueueClient;
 use crate::report::{REPORTS, Report};
 use anyhow::{Context, Result};
@@ -42,15 +44,12 @@ impl AppState {
 
 type HandlerResponse = (StatusCode, Json<OutResponse>);
 
-fn respond(status: StatusCode, log: Vec<String>) -> HandlerResponse {
-    for line in &log {
-        eprintln!("{line}");
-    }
+fn respond(status: StatusCode, log: InvocationLog) -> HandlerResponse {
     (
         status,
         Json(OutResponse {
             Outputs: None,
-            Logs: Some(log),
+            Logs: Some(log.lines()),
             ReturnValue: None,
         }),
     )
@@ -60,6 +59,11 @@ async fn repack_handler(
     State(state): State<Arc<AppState>>,
     req: Result<Json<FuncRequest>, JsonRejection>,
 ) -> HandlerResponse {
+    let log = InvocationLog::new(
+        req.as_ref()
+            .ok()
+            .and_then(|Json(request)| request_id(request)),
+    );
     let job = req
         .map_err(|e| anyhow::anyhow!("{e}"))
         .and_then(|Json(r)| first_payload(r))
@@ -82,13 +86,13 @@ async fn repack_handler(
     let job = match job {
         Ok(job) => job,
         Err(e) => {
-            return respond(
-                StatusCode::BAD_REQUEST,
-                vec![format!("bad repack request: {e:#}")],
-            );
+            return respond(StatusCode::BAD_REQUEST, {
+                log.push(format!("bad repack request: {e:#}"));
+                log
+            });
         }
     };
-    execute_repack(&state, job, &state.repack_queue).await
+    execute_repack(&state, job, &state.repack_queue, log).await
 }
 
 fn maintenance_job(req: FuncRequest) -> Result<queue::Job<lake::repack::RepackPayload>> {
@@ -105,15 +109,20 @@ async fn maintenance_repack_handler(
     State(state): State<Arc<AppState>>,
     req: Result<Json<FuncRequest>, JsonRejection>,
 ) -> HandlerResponse {
+    let log = InvocationLog::new(
+        req.as_ref()
+            .ok()
+            .and_then(|Json(request)| request_id(request)),
+    );
     let job = req
         .map_err(|e| anyhow::anyhow!("{e}"))
         .and_then(|Json(req)| maintenance_job(req));
     match job {
-        Ok(job) => execute_repack(&state, job, &state.maintenance_repack_queue).await,
-        Err(e) => respond(
-            StatusCode::BAD_REQUEST,
-            vec![format!("bad maintenance repack request: {e:#}")],
-        ),
+        Ok(job) => execute_repack(&state, job, &state.maintenance_repack_queue, log).await,
+        Err(e) => {
+            log.push(format!("bad maintenance repack request: {e:#}"));
+            respond(StatusCode::BAD_REQUEST, log)
+        }
     }
 }
 
@@ -121,12 +130,36 @@ async fn execute_repack(
     state: &AppState,
     job: queue::Job<lake::repack::RepackPayload>,
     queue: &QueueClient,
+    log: InvocationLog,
 ) -> HandlerResponse {
-    let mut log = vec![format!("repack job {job:?}")];
-    eprintln!("{}", log[0]);
-    match lake::repack::run(&state.cfg, &job.payload, &mut log).await {
+    match InvocationLog::json("repack job", &job) {
+        Ok(message) => log.push(message),
+        Err(error) => {
+            log.push(format!(
+                "failed to serialize repack job for logging: {error:#}"
+            ));
+            return respond(StatusCode::INTERNAL_SERVER_ERROR, log);
+        }
+    }
+    match lake::repack::run(&state.cfg, &job.payload, &log).await {
         Ok(()) => respond(StatusCode::OK, log),
         Err(e) => {
+            if matches!(
+                e.downcast_ref::<dkplus::Error>(),
+                Some(dkplus::Error::LockUnavailable { .. })
+            ) {
+                match requeue_contended_job(queue, &job, &log).await {
+                    Ok(()) => {
+                        return respond(StatusCode::OK, log);
+                    }
+                    Err(error) => {
+                        log.push(format!(
+                            "failed to requeue repack after lock contention: {error:#}"
+                        ));
+                        return respond(StatusCode::INTERNAL_SERVER_ERROR, log);
+                    }
+                }
+            }
             log.push(format!("repack failed: {e:#}"));
             match queue
                 .retry_or_poison(
@@ -134,7 +167,7 @@ async fn execute_repack(
                     job.retry,
                     std::time::Duration::from_secs(60),
                     &format!("repack failed: {e:#}"),
-                    &mut log,
+                    &log,
                 )
                 .await
             {
@@ -148,18 +181,34 @@ async fn execute_repack(
     }
 }
 
+async fn requeue_contended_job(
+    queue: &QueueClient,
+    job: &impl serde::Serialize,
+    log: &InvocationLog,
+) -> Result<()> {
+    let payload = serde_json::to_string(job)?;
+    queue
+        .send(&payload, std::time::Duration::from_secs(600))
+        .await?;
+    log.push("repack lock is busy; requeued the same job for 600 seconds");
+    Ok(())
+}
+
 async fn plan_repacks_handler(
     State(state): State<Arc<AppState>>,
     req: Result<Json<FuncRequest>, JsonRejection>,
 ) -> HandlerResponse {
+    let log = InvocationLog::new(
+        req.as_ref()
+            .ok()
+            .and_then(|Json(request)| request_id(request)),
+    );
     if let Err(e) = req {
-        return respond(
-            StatusCode::BAD_REQUEST,
-            vec![format!("bad maintenance request: {e}")],
-        );
+        log.push(format!("bad maintenance request: {e}"));
+        return respond(StatusCode::BAD_REQUEST, log);
     }
-    let mut log = vec!["starting table maintenance".to_string()];
-    match lake::maintenance::run(&state.cfg, &state.maintenance_repack_queue, &mut log).await {
+    log.push("starting table maintenance");
+    match lake::maintenance::run(&state.cfg, &state.maintenance_repack_queue, &log).await {
         Ok(()) => respond(StatusCode::OK, log),
         Err(e) => {
             log.push(format!("maintenance failed: {e:#}"));
@@ -172,14 +221,17 @@ async fn cleanup_expired_files_handler(
     State(state): State<Arc<AppState>>,
     req: Result<Json<FuncRequest>, JsonRejection>,
 ) -> HandlerResponse {
+    let log = InvocationLog::new(
+        req.as_ref()
+            .ok()
+            .and_then(|Json(request)| request_id(request)),
+    );
     if let Err(e) = req {
-        return respond(
-            StatusCode::BAD_REQUEST,
-            vec![format!("bad expired-file cleanup request: {e}")],
-        );
+        log.push(format!("bad expired-file cleanup request: {e}"));
+        return respond(StatusCode::BAD_REQUEST, log);
     }
-    let mut log = vec!["starting expired-file cleanup".to_string()];
-    match lake::maintenance::cleanup(&state.cfg, &mut log).await {
+    log.push("starting expired-file cleanup");
+    match lake::maintenance::cleanup(&state.cfg, &log).await {
         Ok(()) => respond(StatusCode::OK, log),
         Err(e) => {
             log.push(format!("expired-file cleanup failed: {e:#}"));
@@ -236,7 +288,7 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
-    eprintln!("rustciso listening on {port}");
+    crate::logging::write_startup(format!("rustciso listening on {port}"));
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -339,6 +391,7 @@ mod tests {
                 MAINTENANCE_REPACK_QUEUE_NAME,
             ),
         });
+        let contended_queue = state.maintenance_repack_queue.clone();
         let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
         let mut app = router(state);
         for name in [REPACK_QUEUE_NAME, MAINTENANCE_REPACK_QUEUE_NAME] {
@@ -411,14 +464,38 @@ mod tests {
                 }),
             ),
         ] {
+            let invocation_id = format!("invocation-{path}");
             let response = http
                 .post(format!("http://{address}/{path}"))
                 .header("content-type", "application/json")
-                .body(json!({"Data": {"input": payload}}).to_string())
+                .body(
+                    json!({
+                        "Data": {"input": payload},
+                        "Metadata": {"Id": invocation_id.clone()}
+                    })
+                    .to_string(),
+                )
                 .send()
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            let response_body: Value =
+                serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+            let logs = response_body["Logs"].as_array().unwrap();
+            assert!(logs.iter().any(|entry| {
+                entry
+                    .as_str()
+                    .is_some_and(|line| line.contains(&format!("invocation_id={invocation_id}")))
+            }));
+            assert!(logs.iter().all(|entry| {
+                entry.as_str().is_some_and(|line| {
+                    line.split_whitespace()
+                        .next()
+                        .is_some_and(|timestamp| {
+                            chrono::DateTime::parse_from_rfc3339(timestamp).is_ok()
+                        })
+                })
+            }));
             let (uri, body) = receive.try_recv().unwrap();
             assert_eq!(uri.path(), format!("/{queue}/messages"));
             assert!(uri.query().unwrap().contains("visibilitytimeout=60"));
@@ -439,6 +516,24 @@ mod tests {
             }
         }
         assert!(receive.try_recv().is_err());
+        let deferred = json!({"table": "ciso.rtprices", "retries": 2, "max_retries": 5});
+        let deferred_log = InvocationLog::new(Some("invocation-lock-busy".into()));
+        requeue_contended_job(&contended_queue, &deferred, &deferred_log)
+            .await
+            .unwrap();
+        let (uri, body) = receive.try_recv().unwrap();
+        assert_eq!(uri.path(), "/maintenance-repack/messages");
+        assert!(uri.query().unwrap().contains("visibilitytimeout=600"));
+        let encoded = body
+            .strip_prefix("<QueueMessage><MessageText>")
+            .unwrap()
+            .strip_suffix("</MessageText></QueueMessage>")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&B64.decode(encoded).unwrap()).unwrap(),
+            deferred
+        );
+        assert!(deferred_log.lines()[0].contains("invocation_id=invocation-lock-busy"));
         server.abort();
     }
 }

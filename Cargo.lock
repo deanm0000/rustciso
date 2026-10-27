@@ -1544,7 +1544,6 @@ dependencies = [
 name = "dkplus"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bytes",
  "chrono",
  "chrono-tz",
@@ -1554,6 +1553,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",

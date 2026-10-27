@@ -12,6 +12,13 @@ pub struct FuncRequest {
     pub Metadata: HashMap<String, Value>,
 }
 
+pub fn request_id(req: &FuncRequest) -> Option<String> {
+    req.Metadata.get("Id").map(|value| match value {
+        Value::String(id) => id.clone(),
+        other => other.to_string(),
+    })
+}
+
 #[allow(non_snake_case)]
 #[derive(Debug, Serialize)]
 pub struct OutResponse {
@@ -52,7 +59,8 @@ mod tests {
         let inner = json!({
             "startdatetime": "20261016T07:00-0000",
             "get_next_until": "20261017T07:00-0000"
-        }).to_string();
+        })
+        .to_string();
         let twice = serde_json::to_string(&inner).unwrap();
         let req = FuncRequest {
             Data: HashMap::from([("rtprices".into(), Value::String(twice))]),
@@ -60,5 +68,14 @@ mod tests {
         };
         let v = first_payload(req).unwrap();
         assert_eq!(v["startdatetime"], "20261016T07:00-0000");
+    }
+
+    #[test]
+    fn reads_metadata_id() {
+        let req = FuncRequest {
+            Data: HashMap::new(),
+            Metadata: HashMap::from([("Id".into(), Value::String("invocation-123".into()))]),
+        };
+        assert_eq!(request_id(&req).as_deref(), Some("invocation-123"));
     }
 }
