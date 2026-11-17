@@ -6,6 +6,7 @@ mod oasis;
 mod prices;
 mod queue;
 mod report;
+mod shadows;
 mod transform;
 
 use crate::azure::{FuncRequest, OutResponse, first_payload, request_id};
@@ -36,9 +37,13 @@ struct AppState {
 
 impl AppState {
     fn queue(&self, report: &Report) -> Result<&QueueClient> {
+        self.queue_named(report.name)
+    }
+
+    fn queue_named(&self, name: &str) -> Result<&QueueClient> {
         self.queues
-            .get(report.name)
-            .with_context(|| format!("no queue configured for {}", report.name))
+            .get(name)
+            .with_context(|| format!("no queue configured for {name}"))
     }
 }
 
@@ -249,6 +254,9 @@ fn router(state: Arc<AppState>) -> Router {
     for report in REPORTS {
         app = app.route(&format!("/{}", report.name), prices::route(report));
     }
+    for report in shadows::REPORTS {
+        app = app.route(&format!("/{}", report.name()), shadows::route(report));
+    }
     app.with_state(state)
 }
 
@@ -259,7 +267,7 @@ async fn main() -> Result<()> {
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .build()?;
-    let queues = REPORTS
+    let mut queues: HashMap<_, _> = REPORTS
         .iter()
         .map(|m| {
             (
@@ -268,6 +276,12 @@ async fn main() -> Result<()> {
             )
         })
         .collect();
+    for report in shadows::REPORTS {
+        queues.insert(
+            report.name(),
+            QueueClient::new(http.clone(), cfg.queue_account.clone(), report.queue_name()),
+        );
+    }
     let repack_queue = QueueClient::new(http.clone(), cfg.queue_account.clone(), REPACK_QUEUE_NAME);
     let maintenance_repack_queue = QueueClient::new(
         http.clone(),

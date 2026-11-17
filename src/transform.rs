@@ -53,16 +53,20 @@ fn raw_schema() -> SchemaRef {
     ]))
 }
 
-/// Builds a reader schema from the CSV header and returns the indexes of the raw columns.
-fn csv_layout(name: &str, data: &[u8]) -> Result<(SchemaRef, [usize; 4])> {
+pub(crate) fn csv_columns(data: &[u8]) -> Vec<String> {
     let header = data.split(|b| *b == b'\n').next().unwrap_or_default();
     let header = String::from_utf8_lossy(header);
-    let columns: Vec<String> = header
+    header
         .trim_start_matches('\u{feff}')
         .trim_end()
         .split(',')
         .map(|c| c.trim().trim_matches('"').to_string())
-        .collect();
+        .collect()
+}
+
+/// Builds a reader schema from the CSV header and returns the indexes of the raw columns.
+fn csv_layout(name: &str, data: &[u8]) -> Result<(SchemaRef, [usize; 4])> {
+    let columns = csv_columns(data);
     let find = |wanted: &[&str]| {
         columns
             .iter()

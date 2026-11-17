@@ -1,0 +1,11 @@
+{
+  "bindings": [
+    {
+      "name": "nomogram_shadows",
+      "type": "queueTrigger",
+      "direction": "in",
+      "queueName": "nomogram-shadows",
+      "connection": "AzureWebJobsStorage"
+    }
+  ]
+}

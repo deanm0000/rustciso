@@ -88,6 +88,12 @@ pub async fn run(cfg: &Config, queue: &QueueClient, log: &InvocationLog) -> Resu
         let schema: String = row.try_get(0)?;
         let name: String = row.try_get(1)?;
         let table_name = format!("{schema}.{name}");
+        if crate::shadows::is_table(&schema, &name) {
+            log.push(format!(
+                "skipping maintenance table {table_name}: partitioned shadow-price repacks are not supported"
+            ));
+            continue;
+        }
         let Some(table) = skip_missing_settings(lake_config.table(&table_name).await, log)
             .with_context(|| format!("resolving maintenance table {table_name}"))?
         else {

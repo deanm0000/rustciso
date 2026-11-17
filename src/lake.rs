@@ -12,7 +12,9 @@ pub const SCHEMA: &str = "ciso";
 pub fn table_builder(cfg: &dkplus::Config, table: &str) -> dkplus::TableBuilder {
     let (schema, name) = table.split_once('.').unwrap_or((SCHEMA, table));
     let builder = dkplus::Table::builder(&format!("{schema}.{name}"), cfg);
-    if schema == SCHEMA && REPORTS.iter().any(|report| report.name == name) {
+    if (schema == SCHEMA && REPORTS.iter().any(|report| report.name == name))
+        || crate::shadows::is_table(schema, name)
+    {
         builder
     } else {
         builder

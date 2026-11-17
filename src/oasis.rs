@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use std::io::{Cursor, Read};
 
-const OASIS_URL: &str = "https://oasis.caiso.com/oasisapi/SingleZip";
+pub(crate) const OASIS_URL: &str = "https://oasis.caiso.com/oasisapi/SingleZip";
 const OASIS_FMT: &str = "%Y%m%dT%H:%M%z";
 const RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_millis(5100);
 const RATE_LIMIT_RETRIES: usize = 2;
@@ -78,7 +78,7 @@ pub async fn fetch(
     fetch_url(client, &url, log).await
 }
 
-async fn fetch_url(
+pub(crate) async fn fetch_url(
     client: &reqwest::Client,
     url: &str,
     log: &InvocationLog,
