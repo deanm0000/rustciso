@@ -1,14 +1,16 @@
 use crate::logging::InvocationLog;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Months, TimeZone, Utc};
+use chrono_tz::America::Los_Angeles;
 use reqwest::StatusCode;
 use std::io::{Cursor, Read};
 
 pub(crate) const OASIS_URL: &str = "https://oasis.caiso.com/oasisapi/SingleZip";
 const OASIS_FMT: &str = "%Y%m%dT%H:%M%z";
-const RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_millis(5100);
+pub(crate) const RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_millis(5100);
 const RATE_LIMIT_RETRIES: usize = 2;
+const TRANSPORT_RETRIES: usize = 2;
 /// OASIS error code for "No data returned for the specified selection".
 const NO_DATA_ERR_CODE: &str = "1000";
 const PROCESSING_ERR_CODE: &str = "1015";
@@ -36,6 +38,27 @@ pub fn parse_oasis_time(s: &str) -> Result<DateTime<Utc>> {
 
 pub fn format_oasis_time(t: DateTime<Utc>) -> String {
     t.format("%Y%m%dT%H:%M-0000").to_string()
+}
+
+pub fn month_start(time: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let local = time.with_timezone(&Los_Angeles);
+    Los_Angeles
+        .with_ymd_and_hms(local.year(), local.month(), 1, 0, 0, 0)
+        .single()
+        .map(|time| time.with_timezone(&Utc))
+        .context("Pacific month boundary is out of range")
+}
+
+pub fn shift_month(time: DateTime<Utc>, forward: bool) -> Result<DateTime<Utc>> {
+    let local = time.with_timezone(&Los_Angeles);
+    let shifted = if forward {
+        local.checked_add_months(Months::new(1))
+    } else {
+        local.checked_sub_months(Months::new(1))
+    };
+    shifted
+        .map(|time| time.with_timezone(&Utc))
+        .context("Pacific month boundary is out of range")
 }
 
 /// The OASIS SingleZip parameters that vary between price reports.
@@ -111,26 +134,38 @@ async fn fetch_body(
     log: &InvocationLog,
     attempt: &mut usize,
 ) -> Result<Bytes> {
+    let mut transport_attempt = 0;
     let body = loop {
         log.push(format!("GET {url}"));
-        let resp = client
-            .get(url)
-            .send()
-            .await
-            .context("OASIS request failed")?;
-        let status = resp.status();
-        if status == StatusCode::TOO_MANY_REQUESTS && *attempt < RATE_LIMIT_RETRIES {
-            *attempt += 1;
-            log.push(format!(
-                "OASIS 429, waiting {RATE_LIMIT_WAIT:?} (retry {attempt}/{RATE_LIMIT_RETRIES})"
-            ));
-            tokio::time::sleep(RATE_LIMIT_WAIT).await;
-            continue;
+        let body = match client.get(url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status == StatusCode::TOO_MANY_REQUESTS && *attempt < RATE_LIMIT_RETRIES {
+                    *attempt += 1;
+                    log.push(format!(
+                        "OASIS 429, waiting {RATE_LIMIT_WAIT:?} (retry {attempt}/{RATE_LIMIT_RETRIES})"
+                    ));
+                    tokio::time::sleep(RATE_LIMIT_WAIT).await;
+                    continue;
+                }
+                if !status.is_success() {
+                    bail!("OASIS returned HTTP {status}");
+                }
+                resp.bytes().await.context("reading OASIS body")
+            }
+            Err(error) => Err(error).context("OASIS request failed"),
+        };
+        match body {
+            Ok(body) => break body,
+            Err(error) if transport_attempt < TRANSPORT_RETRIES => {
+                transport_attempt += 1;
+                log.push(format!(
+                    "{error:#}; waiting {RATE_LIMIT_WAIT:?} before retrying download ({transport_attempt}/{TRANSPORT_RETRIES})"
+                ));
+                tokio::time::sleep(RATE_LIMIT_WAIT).await;
+            }
+            Err(error) => return Err(error),
         }
-        if !status.is_success() {
-            bail!("OASIS returned HTTP {status}");
-        }
-        break resp.bytes().await.context("reading OASIS body")?;
     };
     Ok(body)
 }
@@ -352,6 +387,42 @@ mod tests {
             }
             assert_eq!(server.requests.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn retries_an_interrupted_zip_download() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let zip = zip_of(&[("a.csv", "h\n1\n")]);
+            for body in [&zip[..10], zip.as_slice()] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    zip.len()
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        let log = InvocationLog::default();
+        let result = fetch_url(&reqwest::Client::new(), &url, &log)
+            .await
+            .unwrap();
+        assert!(matches!(result, OasisResult::Csvs(csvs) if csvs.len() == 1));
+        assert!(
+            log.lines()
+                .iter()
+                .any(|line| line.contains("reading OASIS body"))
+        );
+        server.await.unwrap();
     }
 
     #[test]

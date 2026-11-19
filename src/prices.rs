@@ -1,4 +1,5 @@
 //! Shared queue-triggered loader for the OASIS LMP price tables (see `report::REPORTS`).
+//! Catalog write conflicts defer the same window without consuming a queue retry.
 
 use crate::azure::{FuncRequest, first_payload};
 use crate::logging::InvocationLog;
@@ -13,10 +14,30 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio_postgres::error::SqlState;
 
 const ERROR_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 const BACKLOG_ERROR_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
 const BACKLOG_THRESHOLD: u64 = 5;
+
+fn catalog_contention(error: &anyhow::Error) -> bool {
+    fn is_contention(error: &dkplus::Error) -> bool {
+        match error {
+            dkplus::Error::CatalogChanged { .. } => true,
+            dkplus::Error::CommitRetriesExhausted { source, .. } => is_contention(source),
+            dkplus::Error::Catalog { source, .. } => source.as_db_error().is_some_and(|db| {
+                db.code() == &SqlState::T_R_SERIALIZATION_FAILURE
+                    || (db.code() == &SqlState::UNIQUE_VIOLATION
+                        && db.constraint() == Some("ducklake_snapshot_pkey"))
+            }),
+            _ => false,
+        }
+    }
+
+    error
+        .downcast_ref::<dkplus::Error>()
+        .is_some_and(is_contention)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -197,6 +218,22 @@ async fn handle(state: &AppState, report: &Report, job: Job, log: &InvocationLog
                 enqueue(state, report, &job, report.not_ready_retry, "requeued", log).await?;
             }
         }
+        Err(e) if catalog_contention(&e) => {
+            // Advancing would leave a hole; spending the retry budget would kill the chain.
+            log.push(format!(
+                "DuckLake contention loading {}: {e:#}",
+                job.startdatetime
+            ));
+            enqueue(
+                state,
+                report,
+                &job,
+                ERROR_RETRY,
+                "deferred after DuckLake contention",
+                log,
+            )
+            .await?;
+        }
         Err(e) => {
             log.push(format!("error loading {}: {e:#}", job.startdatetime));
             let backlog = match state.queue(report)?.approximate_count().await {
@@ -304,6 +341,30 @@ mod tests {
             repack_if_first: None,
             retry: queue::RetryState::default(),
         }
+    }
+
+    #[test]
+    fn only_transient_catalog_errors_bypass_the_retry_budget() {
+        let exhausted = |source| {
+            anyhow::Error::new(dkplus::Error::CommitRetriesExhausted {
+                attempts: 6,
+                source: Box::new(source),
+            })
+            .context("writing price window")
+        };
+        assert!(catalog_contention(&exhausted(
+            dkplus::Error::CatalogChanged {
+                reason: "another writer committed first".into(),
+            },
+        )));
+        assert!(!catalog_contention(&exhausted(
+            dkplus::Error::InvalidData {
+                reason: "invalid input rows".into(),
+            },
+        )));
+        assert!(!catalog_contention(&anyhow::anyhow!(
+            "ducklake_snapshot_pkey"
+        )));
     }
 
     #[test]

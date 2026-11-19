@@ -7,7 +7,9 @@ mod prices;
 mod queue;
 mod report;
 mod shadows;
+mod supply;
 mod transform;
+mod wind_solar;
 
 use crate::azure::{FuncRequest, OutResponse, first_payload, request_id};
 use crate::config::Config;
@@ -250,7 +252,9 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/repack", post(repack_handler))
         .route("/planRepacks", post(plan_repacks_handler))
         .route("/maintenanceRepack", post(maintenance_repack_handler))
-        .route("/cleanupExpiredFiles", post(cleanup_expired_files_handler));
+        .route("/cleanupExpiredFiles", post(cleanup_expired_files_handler))
+        .route("/supply", post(supply::handler))
+        .route("/wind_solar", post(wind_solar::handler));
     for report in REPORTS {
         app = app.route(&format!("/{}", report.name), prices::route(report));
     }
@@ -282,6 +286,14 @@ async fn main() -> Result<()> {
             QueueClient::new(http.clone(), cfg.queue_account.clone(), report.queue_name()),
         );
     }
+    queues.insert(
+        supply::NAME,
+        QueueClient::new(http.clone(), cfg.queue_account.clone(), supply::NAME),
+    );
+    queues.insert(
+        wind_solar::NAME,
+        QueueClient::new(http.clone(), cfg.queue_account.clone(), wind_solar::QUEUE),
+    );
     let repack_queue = QueueClient::new(http.clone(), cfg.queue_account.clone(), REPACK_QUEUE_NAME);
     let maintenance_repack_queue = QueueClient::new(
         http.clone(),
@@ -430,6 +442,8 @@ mod tests {
             "rtprices",
             "fmprices",
             "daprices",
+            "wind_solar",
+            "supply",
         ] {
             let response = http
                 .post(format!("http://{address}/{path}"))

@@ -12,6 +12,27 @@ pub const SCHEMA: &str = "ciso";
 pub fn table_builder(cfg: &dkplus::Config, table: &str) -> dkplus::TableBuilder {
     let (schema, name) = table.split_once('.').unwrap_or((SCHEMA, table));
     let builder = dkplus::Table::builder(&format!("{schema}.{name}"), cfg);
+    if schema == SCHEMA && name == crate::supply::NAME {
+        return builder
+            .with_time_column("utcbegin")
+            .with_timezone(chrono_tz::America::Los_Angeles)
+            .without_row_grouping()
+            .with_sort_cols(vec!["utcbegin".into()])
+            .with_unique_by_cols(vec!["utcbegin".into()])
+            .with_dedup_timestamp("downloaded_at")
+            .with_author("rustciso")
+            .with_lock_namespace("rustciso.repack");
+    }
+    if schema == SCHEMA && name == crate::wind_solar::NAME {
+        return builder
+            .with_time_column("utcbegin")
+            .with_timezone(chrono_tz::America::Los_Angeles)
+            .with_sort_cols(vec![
+                "utcbegin".into(),
+                "trading_hub".into(),
+                "renewable_type".into(),
+            ]);
+    }
     if (schema == SCHEMA && REPORTS.iter().any(|report| report.name == name))
         || crate::shadows::is_table(schema, name)
     {

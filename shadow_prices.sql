@@ -44,7 +44,7 @@ CREATE TABLE ciso.nomogram_shadows (
     shadow_price DOUBLE, -- PRICE (summary) / PRC (interval)
     -- "group" BIGINT, -- GROUP: export grouping ordinal.
     downloaded_at TIMESTAMPTZ -- Generated at ingestion; no OASIS source column.
-);
+) using ducklake;
 
 ALTER TABLE ciso.nomogram_shadows SET PARTITIONED BY (market_type);
 
@@ -73,6 +73,7 @@ CREATE TABLE ciso.intertie_shadows (
     shadow_price DOUBLE, -- PRICE (summary) / PRC (interval)
     -- "group" BIGINT, -- GROUP: export grouping ordinal.
     downloaded_at TIMESTAMPTZ -- Generated at ingestion; no OASIS source column.
-);
+)  using ducklake;
 
 ALTER TABLE ciso.intertie_shadows SET PARTITIONED BY (market_type);
+

@@ -6,14 +6,13 @@ mod transform;
 
 use crate::azure::{FuncRequest, first_payload};
 use crate::logging::InvocationLog;
-use crate::oasis::{self, OasisResult};
+use crate::oasis::{self, OasisResult, month_start, shift_month};
 use crate::{AppState, lake, queue, respond};
 use anyhow::{Context, Result, bail, ensure};
 use axum::Json;
 use axum::extract::{State, rejection::JsonRejection};
 use axum::http::StatusCode;
-use chrono::{DateTime, Datelike, Duration, Months, TimeZone, Timelike, Utc};
-use chrono_tz::America::Los_Angeles;
+use chrono::{DateTime, Duration, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -140,27 +139,6 @@ type Job = queue::Job<Payload>;
 struct Window {
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-}
-
-fn month_start(time: DateTime<Utc>) -> Result<DateTime<Utc>> {
-    let local = time.with_timezone(&Los_Angeles);
-    Los_Angeles
-        .with_ymd_and_hms(local.year(), local.month(), 1, 0, 0, 0)
-        .single()
-        .map(|time| time.with_timezone(&Utc))
-        .context("Pacific month boundary is out of range")
-}
-
-fn shift_month(time: DateTime<Utc>, forward: bool) -> Result<DateTime<Utc>> {
-    let local = time.with_timezone(&Los_Angeles);
-    let shifted = if forward {
-        local.checked_add_months(Months::new(1))
-    } else {
-        local.checked_sub_months(Months::new(1))
-    };
-    shifted
-        .map(|time| time.with_timezone(&Utc))
-        .context("Pacific month boundary is out of range")
 }
 
 impl Payload {
