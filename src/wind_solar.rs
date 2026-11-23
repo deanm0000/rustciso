@@ -30,6 +30,8 @@ struct Payload {
     stopdatetime: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     get_prev_until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    get_next_until: Option<String>,
 }
 
 type Job = queue::Job<Payload>;
@@ -62,7 +64,7 @@ impl Window {
 }
 
 impl Payload {
-    fn windows(&self) -> Result<(Window, Option<Payload>)> {
+    fn windows(&self, now: DateTime<Utc>) -> Result<(Option<Window>, Option<(Payload, Duration)>)> {
         let start = parse_oasis_time(&self.startdatetime)?;
         let stop = self
             .stopdatetime
@@ -76,13 +78,38 @@ impl Payload {
             .map(parse_oasis_time)
             .transpose()
             .context("invalid get_prev_until")?;
+        if let Some(bound) = &self.get_next_until {
+            ensure!(
+                stop.is_none() && cutoff.is_none(),
+                "get_next_until cannot be combined with stopdatetime or get_prev_until"
+            );
+            let plan = oasis::forward_window(start, parse_oasis_time(bound)?, now)?;
+            let next = plan.next.map(|next| {
+                (
+                    Payload {
+                        startdatetime: format_oasis_time(next),
+                        stopdatetime: None,
+                        get_prev_until: None,
+                        get_next_until: self.get_next_until.clone(),
+                    },
+                    plan.delay,
+                )
+            });
+            return Ok((plan.end.map(|end| Window { start, end }), next));
+        }
         let (end, previous) = oasis::month_window(start, stop, cutoff)?;
-        let previous = previous.map(|prev_start| Payload {
-            startdatetime: format_oasis_time(prev_start),
-            stopdatetime: Some(format_oasis_time(start)),
-            get_prev_until: self.get_prev_until.clone(),
+        let previous = previous.map(|prev_start| {
+            (
+                Payload {
+                    startdatetime: format_oasis_time(prev_start),
+                    stopdatetime: Some(format_oasis_time(start)),
+                    get_prev_until: self.get_prev_until.clone(),
+                    get_next_until: None,
+                },
+                Duration::ZERO,
+            )
         });
-        Ok((Window { start, end }, previous))
+        Ok((Some(Window { start, end }), previous))
     }
 }
 
@@ -204,7 +231,8 @@ mod tests {
             "retries": 1
         }))
         .unwrap();
-        let (window, previous) = job.payload.windows().unwrap();
+        let (window, previous) = job.payload.windows(Utc::now()).unwrap();
+        let window = window.unwrap();
         assert_eq!(format_oasis_time(window.end), "20261201T08:00-0000");
         let chunks = window.chunks(CHUNK).collect::<Vec<_>>();
         assert_eq!(chunks.len(), 3);
@@ -213,10 +241,37 @@ mod tests {
         for pair in chunks.windows(2) {
             assert_eq!(pair[0].end, pair[1].start);
         }
-        let (backfill, done) = previous.unwrap().windows().unwrap();
+        let (backfill, done) = previous.unwrap().0.windows(Utc::now()).unwrap();
+        let backfill = backfill.unwrap();
         assert_eq!(format_oasis_time(backfill.start), "20261015T07:00-0000");
         assert_eq!(backfill.end, window.start);
         assert!(done.is_none());
+    }
+
+    #[test]
+    fn forward_payload_waits_for_closed_hour_and_preserves_bound() {
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "startdatetime": "20261119T13:00-0000",
+            "get_next_until": "20400101T00:00-0000"
+        }))
+        .unwrap();
+        let (window, next) = job
+            .payload
+            .windows(parse_oasis_time("20261119T13:45-0000").unwrap())
+            .unwrap();
+        assert!(window.is_none());
+        let (next, delay) = next.unwrap();
+        assert_eq!(next.startdatetime, job.payload.startdatetime);
+        assert_eq!(next.get_next_until, job.payload.get_next_until);
+        assert_eq!(delay, Duration::from_secs(1200));
+        let (window, next) = next
+            .windows(parse_oasis_time("20261119T14:05-0000").unwrap())
+            .unwrap();
+        assert_eq!(
+            format_oasis_time(window.unwrap().end),
+            "20261119T14:00-0000"
+        );
+        assert_eq!(next.unwrap().0.startdatetime, "20261119T14:00-0000");
     }
 
     #[test]
@@ -304,7 +359,7 @@ fn market_batch(
     )?)
 }
 
-async fn load(state: &AppState, window: Window, log: &InvocationLog) -> Result<()> {
+async fn load(state: &AppState, window: Window, log: &InvocationLog) -> Result<bool> {
     let mut rows = Rows::new();
     let mut pending = window
         .chunks(CHUNK)
@@ -345,7 +400,7 @@ async fn load(state: &AppState, window: Window, log: &InvocationLog) -> Result<(
     }
     if rows.is_empty() {
         log.push("no wind_solar rows; leaving stored data unchanged");
-        return Ok(());
+        return Ok(false);
     }
     let table = lake::resolve_table(&state.cfg.lake(log.clone()), TABLE).await?;
     let downloaded_at = Utc::now();
@@ -359,7 +414,7 @@ async fn load(state: &AppState, window: Window, log: &InvocationLog) -> Result<(
             loaded.snapshot_id, loaded.rows
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 pub async fn handler(
@@ -369,44 +424,59 @@ pub async fn handler(
     let log = InvocationLog::new(req.as_ref().ok().and_then(|Json(req)| request_id(req)));
     let parsed = (|| -> Result<_> {
         let job: Job = serde_json::from_value(first_payload(req?.0)?)?;
-        let (window, previous) = job.payload.windows()?;
-        Ok((job, window, previous))
+        let (window, next) = job.payload.windows(Utc::now())?;
+        Ok((job, window, next))
     })();
-    let (job, window, previous) = match parsed {
+    let (job, window, next) = match parsed {
         Ok(parsed) => parsed,
         Err(error) => {
             log.push(format!("bad wind_solar request: {error:#}"));
             return respond(StatusCode::BAD_REQUEST, log);
         }
     };
-    log.push(format!(
-        "wind_solar loading [{}, {})",
-        window.start, window.end
-    ));
     let result = async {
-        if let Err(error) = load(&state, window, &log).await {
-            let reason = format!(
-                "error loading wind_solar [{}, {}): {error:#}",
+        if let Some(window) = window {
+            log.push(format!(
+                "wind_solar loading [{}, {})",
                 window.start, window.end
-            );
-            log.push(&reason);
-            return state
-                .queue_named(NAME)?
-                .retry_or_poison(&job, job.retry, RETRY_DELAY, &reason, &log)
-                .await;
+            ));
+            match load(&state, window, &log).await {
+                Err(error) => {
+                    let reason = format!(
+                        "error loading wind_solar [{}, {}): {error:#}",
+                        window.start, window.end
+                    );
+                    log.push(&reason);
+                    return state
+                        .queue_named(NAME)?
+                        .retry_or_poison(&job, job.retry, RETRY_DELAY, &reason, &log)
+                        .await;
+                }
+                Ok(false)
+                    if job.payload.get_next_until.is_some()
+                        && oasis::retry_empty_forward(window.start, Utc::now()) =>
+                {
+                    log.push("recent forward window has no rows; retrying in five minutes");
+                    return state
+                        .queue_named(NAME)?
+                        .send(&serde_json::to_string(&job)?, Duration::from_secs(300))
+                        .await;
+                }
+                Ok(_) => {}
+            }
+            log.push(format!(
+                "wind_solar completed [{}, {})",
+                window.start, window.end
+            ));
         }
-        log.push(format!(
-            "wind_solar completed [{}, {})",
-            window.start, window.end
-        ));
-        if let Some(payload) = previous {
+        if let Some((payload, delay)) = next {
             let next = Job {
                 payload,
                 retry: job.retry.fresh(),
             };
             state
                 .queue_named(NAME)?
-                .send(&serde_json::to_string(&next)?, Duration::ZERO)
+                .send(&serde_json::to_string(&next)?, delay)
                 .await?;
         }
         Ok(())

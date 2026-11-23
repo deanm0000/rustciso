@@ -30,3 +30,16 @@ rows untouched. Partitioned repacking is not supported.
 
 Failures use the [shared retry/poison policy](../rtprices/README.md#retry-policy-all-queue-triggers).
 A poisoned job stops its backward chain; requeue the failing window to resume.
+
+For ongoing forward ingestion, supply `startdatetime` and an inclusive,
+hour-aligned `get_next_until`; do not combine this with `stopdatetime` or
+`get_prev_until`. Forward jobs cover at most one day and never cross a Pacific
+month boundary. They wait until each hour has closed plus five minutes. Empty
+recent windows retry after five minutes; empty historical windows advance.
+
+```json
+{
+  "startdatetime": "20261119T13:00-0000",
+  "get_next_until": "20400101T00:00-0000"
+}
+```

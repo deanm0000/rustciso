@@ -1,7 +1,7 @@
 use crate::logging::InvocationLog;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use chrono::{DateTime, Datelike, Months, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Months, TimeDelta, TimeZone, Utc};
 use chrono_tz::America::Los_Angeles;
 use reqwest::StatusCode;
 use std::io::{Cursor, Read};
@@ -100,6 +100,56 @@ pub(crate) fn month_window(
         None
     };
     Ok((end, previous))
+}
+
+pub(crate) struct ForwardWindow {
+    pub end: Option<DateTime<Utc>>,
+    pub next: Option<DateTime<Utc>>,
+    pub delay: std::time::Duration,
+}
+
+pub(crate) fn forward_window(
+    start: DateTime<Utc>,
+    bound: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<ForwardWindow> {
+    anyhow::ensure!(
+        start.timestamp().rem_euclid(3600) == 0
+            && bound.timestamp().rem_euclid(3600) == 0
+            && start <= bound,
+        "forward start and get_next_until must be hour-aligned, with start no later than the bound"
+    );
+    let ready = now - TimeDelta::minutes(5);
+    let closed = DateTime::from_timestamp(ready.timestamp().div_euclid(3600) * 3600, 0)
+        .context("forward readiness time out of range")?;
+    let delay = |time: DateTime<Utc>| {
+        (time + TimeDelta::minutes(65) - now)
+            .to_std()
+            .unwrap_or_default()
+            .max(std::time::Duration::from_secs(6))
+            .min(crate::queue::MAX_VISIBILITY)
+    };
+    if start >= closed {
+        return Ok(ForwardWindow {
+            end: None,
+            next: Some(start),
+            delay: delay(start),
+        });
+    }
+    let end = (start + TimeDelta::days(1))
+        .min(shift_month(month_start(start)?, true)?)
+        .min(closed)
+        .min(bound + TimeDelta::hours(1));
+    let next = (end <= bound).then_some(end);
+    Ok(ForwardWindow {
+        end: Some(end),
+        next,
+        delay: next.map(delay).unwrap_or_default(),
+    })
+}
+
+pub(crate) fn retry_empty_forward(start: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    start >= now - TimeDelta::days(1)
 }
 
 /// The OASIS SingleZip parameters that vary between price reports.
@@ -267,6 +317,56 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    #[test]
+    fn forward_windows_respect_readiness_months_and_inclusive_bound() {
+        let parse = |s| parse_oasis_time(s).unwrap();
+        let now = parse("20261201T10:03-0000");
+        let plan = forward_window(
+            parse("20261130T08:00-0000"),
+            parse("20400101T00:00-0000"),
+            now,
+        )
+        .unwrap();
+        assert_eq!(plan.end, Some(parse("20261201T08:00-0000")));
+        assert_eq!(plan.next, plan.end);
+        assert_eq!(plan.delay, std::time::Duration::from_secs(6));
+        let plan = forward_window(
+            parse("20261201T09:00-0000"),
+            parse("20400101T00:00-0000"),
+            now,
+        )
+        .unwrap();
+        assert_eq!(plan.end, None);
+        assert_eq!(plan.next, Some(parse("20261201T09:00-0000")));
+        assert_eq!(plan.delay, std::time::Duration::from_secs(120));
+        let plan = forward_window(
+            parse("20261201T08:00-0000"),
+            parse("20261201T08:00-0000"),
+            now,
+        )
+        .unwrap();
+        assert_eq!(plan.end, Some(parse("20261201T09:00-0000")));
+        assert_eq!(plan.next, None);
+        assert!(
+            forward_window(
+                parse("20261201T08:15-0000"),
+                parse("20400101T00:00-0000"),
+                now
+            )
+            .is_err()
+        );
+        assert!(retry_empty_forward(parse("20261201T09:00-0000"), now));
+        assert!(!retry_empty_forward(parse("20261130T09:00-0000"), now));
+        assert!(
+            forward_window(
+                parse("20261201T08:00-0000"),
+                parse("20261201T07:00-0000"),
+                now
+            )
+            .is_err()
+        );
+    }
+
     const NO_DATA_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <m:OASISReport xmlns:m="http://www.caiso.com/soa/OASISReport_v1.xsd">
 <m:MessagePayload><m:RTO><m:name>CAISO</m:name>
@@ -338,7 +438,7 @@ mod tests {
         let url = build_url(&crate::report::DAPRICES.query, t, end);
         assert_eq!(
             url,
-            "https://oasis.caiso.com/oasisapi/SingleZip?resultformat=6&queryname=PRC_LMP&version=12&startdatetime=20261016T07:00-0000&enddatetime=20261017T07:00-0000&market_run_id=DAM&grp_type=ALL_APNODES"
+            "https://oasis.caiso.com/oasisapi/SingleZip?resultformat=6&queryname=PRC_LMP&version=12&startdatetime=20261016T07:00-0000&enddatetime=20261017T07:00-0000&market_run_id=DAM&grp_type=ALL"
         );
     }
 

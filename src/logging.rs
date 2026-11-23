@@ -57,7 +57,7 @@ mod tests {
         let line = log.lines().pop().unwrap();
         assert!(line.starts_with("20"));
         assert!(line.contains("T"));
-        assert!(line.contains("Z invocation_id=invocation-123 started"));
+        assert!(line.contains("Z invocation_id=invocation-123\nstarted"));
     }
 
     #[test]

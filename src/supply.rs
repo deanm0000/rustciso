@@ -39,8 +39,15 @@ const COLUMNS: [&str; 13] = [
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 enum Payload {
-    Backfill { date: NaiveDate, until: NaiveDate },
-    Forward { date: NaiveDate },
+    Backfill {
+        date: NaiveDate,
+        until: NaiveDate,
+    },
+    Forward {
+        date: NaiveDate,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<NaiveDate>,
+    },
 }
 
 type Job = queue::Job<Payload>;
@@ -71,18 +78,38 @@ impl Payload {
                     }
                 }
             }
-            Self::Forward { date } => {
+            Self::Forward { date, until } => {
                 ensure!(date <= today, "forward date must not be in the future");
+                ensure!(
+                    until.is_none_or(|until| date <= until),
+                    "forward date must not be after until"
+                );
+                let last = until.map_or(today, |until| until.min(today));
                 let mut day = date;
                 loop {
                     dates.push(day);
-                    if day == today {
+                    if day == last {
+                        if until.is_some_and(|until| until < today) {
+                            return Ok((dates, None));
+                        }
                         let yesterday = today.pred_opt().context("forward date underflow")?;
-                        return Ok((dates, Some((Self::Forward { date: yesterday }, POLL_DELAY))));
+                        return Ok((
+                            dates,
+                            Some((
+                                Self::Forward {
+                                    date: yesterday,
+                                    until,
+                                },
+                                POLL_DELAY,
+                            )),
+                        ));
                     }
                     day = day.succ_opt().context("forward date overflow")?;
                     if dates.len() == 31 {
-                        return Ok((dates, Some((Self::Forward { date: day }, Duration::ZERO))));
+                        return Ok((
+                            dates,
+                            Some((Self::Forward { date: day, until }, Duration::ZERO)),
+                        ));
                     }
                 }
             }
@@ -400,6 +427,7 @@ mod tests {
         assert_eq!(next, None);
         let (dates, next) = (Payload::Forward {
             date: date("2026-11-18"),
+            until: None,
         })
         .plan(today)
         .unwrap();
@@ -408,13 +436,15 @@ mod tests {
             next,
             Some((
                 Payload::Forward {
-                    date: date("2026-11-18")
+                    date: date("2026-11-18"),
+                    until: None,
                 },
                 POLL_DELAY
             ))
         );
         let (dates, next) = (Payload::Forward {
             date: date("2026-10-01"),
+            until: None,
         })
         .plan(today)
         .unwrap();
@@ -423,7 +453,8 @@ mod tests {
             next,
             Some((
                 Payload::Forward {
-                    date: date("2026-11-01")
+                    date: date("2026-11-01"),
+                    until: None,
                 },
                 Duration::ZERO
             ))
@@ -442,6 +473,37 @@ mod tests {
                 until: date("2026-11-18")
             })
             .plan(today)
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_forward_polls_through_the_last_day_then_stops() {
+        let until = date("2040-01-01");
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "mode": "forward", "date": "2039-12-31", "until": "2040-01-01"
+        }))
+        .unwrap();
+        let (dates, next) = job.payload.plan(until).unwrap();
+        assert_eq!(dates, [date("2039-12-31"), until]);
+        let (next, delay) = next.unwrap();
+        assert_eq!(delay, POLL_DELAY);
+        assert_eq!(
+            next,
+            Payload::Forward {
+                date: date("2039-12-31"),
+                until: Some(until)
+            }
+        );
+        let (dates, next) = next.plan(date("2040-01-02")).unwrap();
+        assert_eq!(dates, [date("2039-12-31"), until]);
+        assert!(next.is_none());
+        assert!(
+            Payload::Forward {
+                date: date("2040-01-02"),
+                until: Some(until)
+            }
+            .plan(date("2040-01-02"))
             .is_err()
         );
     }

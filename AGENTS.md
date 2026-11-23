@@ -44,6 +44,8 @@ read-only transaction. Do not modify production data, grants, or database
 sessions without explicit authorization. Never assume passwordless production
 database access.
 
+To troubleshoot and/or verify data ingestion, check the prod db with `psql -h projectsdb.usspapps.com -p 55669 -U cisoscraper -d everything`. 
+
 The Azure CLI executable is available in WSL at:
 
 ```text
@@ -51,8 +53,9 @@ The Azure CLI executable is available in WSL at:
 ```
 
 Before any Azure operation, confirm the active account and subscription with
-`az account show`. Do not expose subscription credentials or application
-settings.
+`az account show | jq -r '.name'` which should show 'pd-segment-projects-amer'. Do not expose subscription credentials or application settings.
+
+This azure function app is 'app-ciso', and its storage queues are in the storage account 'stciso'. The application insights resource is also named 'app-ciso'. All 3 are in the resource group rg-ciso.
 
 ## Production release and verification
 
