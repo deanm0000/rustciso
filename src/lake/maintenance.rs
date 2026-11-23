@@ -90,6 +90,7 @@ pub async fn run(cfg: &Config, queue: &QueueClient, log: &InvocationLog) -> Resu
         let table_name = format!("{schema}.{name}");
         if crate::shadows::is_table(&schema, &name)
             || (schema == super::SCHEMA && name == crate::wind_solar::NAME)
+            || (schema == super::SCHEMA && name == crate::load_fcst::HOURLY)
         {
             log.push(format!(
                 "skipping maintenance table {table_name}: partitioned repacks are not supported"

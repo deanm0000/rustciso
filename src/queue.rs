@@ -221,7 +221,7 @@ mod tests {
         use axum::{
             Router,
             body::Bytes,
-            http::{Method, StatusCode, Uri},
+            http::{HeaderMap, Method, StatusCode, Uri},
         };
         use std::sync::{
             Arc, Mutex,
@@ -231,15 +231,18 @@ mod tests {
         let failures = Arc::new(AtomicU8::new(0));
         let captured = requests.clone();
         let fail = failures.clone();
-        let app = Router::new().fallback(move |method: Method, uri: Uri, body: Bytes| {
+        let app = Router::new().fallback(move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
             let is_poison = uri.path().contains("-poison");
             let mode = fail.load(Ordering::SeqCst);
             let rejected = (mode == 1 && method == Method::POST)
                 || (mode == 2 && method == Method::PUT)
                 || (mode == 3 && method == Method::POST && is_poison);
+            let missing_length = method == Method::PUT && headers.get("content-length").is_none_or(|value| value != "0");
             captured.lock().unwrap().push((method, uri, body));
             async move {
-                if rejected {
+                if missing_length {
+                    StatusCode::LENGTH_REQUIRED
+                } else if rejected {
                     StatusCode::SERVICE_UNAVAILABLE
                 } else {
                     StatusCode::CREATED
@@ -487,6 +490,7 @@ impl QueueClient {
             .collect::<Vec<_>>()
             .join("&");
         let url = format!("{}{path}?{qs}", self.account.queue_endpoint);
+        let empty_put = method == reqwest::Method::PUT && body.is_empty();
         let mut req = self
             .http
             .request(method, url)
@@ -495,6 +499,8 @@ impl QueueClient {
             .header("Authorization", auth);
         if !body.is_empty() {
             req = req.header("Content-Type", content_type).body(body);
+        } else if empty_put {
+            req = req.header("Content-Length", "0");
         }
         Ok(req.send().await?)
     }

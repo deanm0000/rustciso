@@ -36,7 +36,8 @@ After successfully loading the hour:
   or false flags disable that repack condition.
 
 Continuations wait until their hour has closed plus five minutes, with queue
-visibility capped at seven days. Historical hours are immediately visible.
+visibility capped at seven days. Historical hours are immediately visible,
+except FMM continuations, which wait at least six seconds.
 Retries do not emit continuations or repack jobs.
 
 ## Retry policy (all queue triggers)
@@ -56,6 +57,13 @@ reason is logged. No further retry or continuation is scheduled.
 Successful continuation and price-generated repack jobs inherit `max_retries`
 but start with a fresh retry count. Maintenance-generated repack jobs use
 the defaults.
+
+If the Azure Functions host sees an invocation fail (for example, because
+the Rust worker exits before acknowledging it), it can redeliver the
+original message, with up to three total deliveries. The host uses a
+30-second retry delay when it can record the failure; an abrupt host exit
+may leave the message invisible until its existing lease expires. These
+redeliveries are separate from the application retry count above.
 
 OASIS "no data" responses for dates before today in `America/Los_Angeles`
 stop immediately, logging the reason without requeuing, poisoning, or emitting

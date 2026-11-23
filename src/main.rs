@@ -1,6 +1,7 @@
 mod azure;
 mod config;
 mod lake;
+mod load_fcst;
 mod logging;
 mod oasis;
 mod prices;
@@ -254,7 +255,8 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/maintenanceRepack", post(maintenance_repack_handler))
         .route("/cleanupExpiredFiles", post(cleanup_expired_files_handler))
         .route("/supply", post(supply::handler))
-        .route("/wind_solar", post(wind_solar::handler));
+        .route("/wind_solar", post(wind_solar::handler))
+        .route("/load_fcst", post(load_fcst::handler));
     for report in REPORTS {
         app = app.route(&format!("/{}", report.name), prices::route(report));
     }
@@ -293,6 +295,10 @@ async fn main() -> Result<()> {
     queues.insert(
         wind_solar::NAME,
         QueueClient::new(http.clone(), cfg.queue_account.clone(), wind_solar::QUEUE),
+    );
+    queues.insert(
+        load_fcst::NAME,
+        QueueClient::new(http.clone(), cfg.queue_account.clone(), load_fcst::QUEUE),
     );
     let repack_queue = QueueClient::new(http.clone(), cfg.queue_account.clone(), REPACK_QUEUE_NAME);
     let maintenance_repack_queue = QueueClient::new(
@@ -443,6 +449,7 @@ mod tests {
             "fmprices",
             "daprices",
             "wind_solar",
+            "load_fcst",
             "supply",
         ] {
             let response = http

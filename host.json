@@ -13,7 +13,12 @@
     "version": "[4.*, 5.0.0)"
   },
   "extensions": {
-    "queues": { "batchSize": 1, "newBatchThreshold": 0, "maxDequeueCount": 1 }
+    "queues": {
+      "batchSize": 1,
+      "newBatchThreshold": 0,
+      "maxDequeueCount": 3,
+      "visibilityTimeout": "00:00:30"
+    }
   },
   "customHandler": {
     "description": {

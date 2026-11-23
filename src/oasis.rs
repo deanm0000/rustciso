@@ -61,6 +61,47 @@ pub fn shift_month(time: DateTime<Utc>, forward: bool) -> Result<DateTime<Utc>> 
         .context("Pacific month boundary is out of range")
 }
 
+pub(crate) fn month_window(
+    start: DateTime<Utc>,
+    stop: Option<DateTime<Utc>>,
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<(DateTime<Utc>, Option<DateTime<Utc>>)> {
+    let month = month_start(start)?;
+    let next_month = shift_month(month, true)?;
+    let end = stop.unwrap_or(next_month);
+    anyhow::ensure!(
+        start < end && end <= next_month,
+        "window must be within one Pacific calendar month (exclusive stop)"
+    );
+    anyhow::ensure!(
+        [start, end]
+            .iter()
+            .all(|t| t.timestamp().rem_euclid(3600) == 0),
+        "startdatetime and stopdatetime must be hour-aligned"
+    );
+    let previous = if let Some(cutoff) = cutoff {
+        anyhow::ensure!(
+            cutoff <= start && cutoff.timestamp().rem_euclid(3600) == 0,
+            "get_prev_until must be hour-aligned and no later than startdatetime"
+        );
+        if cutoff < start {
+            Some(
+                if month == start {
+                    shift_month(month, false)?
+                } else {
+                    month
+                }
+                .max(cutoff),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok((end, previous))
+}
+
 /// The OASIS SingleZip parameters that vary between price reports.
 #[derive(Debug, Clone, Copy)]
 pub struct OasisQuery {

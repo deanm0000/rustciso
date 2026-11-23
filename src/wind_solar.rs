@@ -64,45 +64,24 @@ impl Window {
 impl Payload {
     fn windows(&self) -> Result<(Window, Option<Payload>)> {
         let start = parse_oasis_time(&self.startdatetime)?;
-        let month = oasis::month_start(start)?;
-        let next_month = oasis::shift_month(month, true)?;
-        let end = match &self.stopdatetime {
-            Some(end) => parse_oasis_time(end).context("invalid stopdatetime")?,
-            None => next_month,
-        };
-        ensure!(
-            start < end && end <= next_month,
-            "window must be within one Pacific calendar month (exclusive stop)"
-        );
-        ensure!(
-            [start, end]
-                .iter()
-                .all(|t| t.timestamp().rem_euclid(3600) == 0),
-            "startdatetime and stopdatetime must be hour-aligned"
-        );
-        let previous = if let Some(bound) = &self.get_prev_until {
-            let cutoff = parse_oasis_time(bound).context("invalid get_prev_until")?;
-            ensure!(
-                cutoff <= start && cutoff.timestamp().rem_euclid(3600) == 0,
-                "get_prev_until must be hour-aligned and no later than startdatetime"
-            );
-            if cutoff < start {
-                let prev_start = if month == start {
-                    oasis::shift_month(month, false)?
-                } else {
-                    month
-                };
-                Some(Payload {
-                    startdatetime: format_oasis_time(prev_start.max(cutoff)),
-                    stopdatetime: Some(format_oasis_time(start)),
-                    get_prev_until: Some(bound.clone()),
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let stop = self
+            .stopdatetime
+            .as_deref()
+            .map(parse_oasis_time)
+            .transpose()
+            .context("invalid stopdatetime")?;
+        let cutoff = self
+            .get_prev_until
+            .as_deref()
+            .map(parse_oasis_time)
+            .transpose()
+            .context("invalid get_prev_until")?;
+        let (end, previous) = oasis::month_window(start, stop, cutoff)?;
+        let previous = previous.map(|prev_start| Payload {
+            startdatetime: format_oasis_time(prev_start),
+            stopdatetime: Some(format_oasis_time(start)),
+            get_prev_until: self.get_prev_until.clone(),
+        });
         Ok((Window { start, end }, previous))
     }
 }

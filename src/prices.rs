@@ -19,6 +19,7 @@ use tokio_postgres::error::SqlState;
 const ERROR_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 const BACKLOG_ERROR_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
 const BACKLOG_THRESHOLD: u64 = 5;
+const FM_CONTINUATION_DELAY: std::time::Duration = std::time::Duration::from_secs(6);
 
 fn catalog_contention(error: &anyhow::Error) -> bool {
     fn is_contention(error: &dkplus::Error) -> bool {
@@ -147,7 +148,7 @@ async fn load_window(
     Ok(Outcome::Loaded)
 }
 
-/// Delay until OASIS is expected to have the window starting at `next_start`, capped at 7 days.
+/// Wait for publication and leave a gap between consecutive FMM OASIS requests.
 fn next_visibility(
     report: &Report,
     next_start: DateTime<Utc>,
@@ -156,6 +157,11 @@ fn next_visibility(
     (report.ready_at(next_start) - now)
         .to_std()
         .unwrap_or_default()
+        .max(if report.name == crate::report::FMPRICES.name {
+            FM_CONTINUATION_DELAY
+        } else {
+            std::time::Duration::ZERO
+        })
         .min(queue::MAX_VISIBILITY)
 }
 
@@ -567,6 +573,7 @@ mod tests {
         assert_eq!(next_visibility(&FMPRICES, next, now).as_secs(), 35 * 60);
         let much_later = oasis::parse_oasis_time("20261020T00:00-0000").unwrap();
         assert_eq!(next_visibility(&RTPRICES, next, much_later).as_secs(), 0);
+        assert_eq!(next_visibility(&FMPRICES, next, much_later).as_secs(), 6);
         let long_before = oasis::parse_oasis_time("20261001T00:00-0000").unwrap();
         assert_eq!(
             next_visibility(&RTPRICES, next, long_before),

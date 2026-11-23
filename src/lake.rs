@@ -33,6 +33,20 @@ pub fn table_builder(cfg: &dkplus::Config, table: &str) -> dkplus::TableBuilder 
                 "renewable_type".into(),
             ]);
     }
+    if schema == SCHEMA
+        && [
+            crate::load_fcst::HOURLY,
+            crate::load_fcst::RTPD,
+            crate::load_fcst::RTM,
+        ]
+        .contains(&name)
+    {
+        return builder
+            .with_time_column("utcbegin")
+            .with_timezone(chrono_tz::America::Los_Angeles)
+            .without_row_grouping()
+            .with_sort_cols(vec!["utcbegin".into(), "tac_area".into()]);
+    }
     if (schema == SCHEMA && REPORTS.iter().any(|report| report.name == name))
         || crate::shadows::is_table(schema, name)
     {

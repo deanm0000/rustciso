@@ -1,0 +1,11 @@
+{
+  "bindings": [
+    {
+      "name": "load_fcst",
+      "type": "queueTrigger",
+      "direction": "in",
+      "queueName": "load-fcst",
+      "connection": "AzureWebJobsStorage"
+    }
+  ]
+}
