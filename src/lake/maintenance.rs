@@ -24,18 +24,49 @@ fn cleanup_options(now: DateTime<Utc>) -> CleanupOptions {
     }
 }
 
+fn temp_cleanup_cutoff(now: DateTime<Utc>) -> DateTime<Utc> {
+    now - chrono::Duration::days(1)
+}
+
 pub async fn cleanup(cfg: &Config, log: &InvocationLog) -> Result<()> {
-    let report = dkplus::maintenance::cleanup_expired_files(
-        &cfg.lake(log.clone()),
-        &cleanup_options(Utc::now()),
-    )
-    .await
-    .context("cleaning up expired catalog files")?;
+    let lake = cfg.lake(log.clone());
+    let scheduled =
+        dkplus::maintenance::schedule_unreferenced_table_files(&lake, super::SCHEMA, "rtprices")
+            .await
+            .context("scheduling unreferenced rtprices files")?;
+    log.push(format!(
+        "scheduled {scheduled} unreferenced ciso.rtprices files for cleanup"
+    ));
+    let report = dkplus::maintenance::cleanup_expired_files(&lake, &cleanup_options(Utc::now()))
+        .await
+        .context("cleaning up expired catalog files")?;
     log.push(format!(
         "expired-file cleanup: {} candidates, {} deleted, {} already missing",
         report.files.len(),
         report.deleted,
         report.already_missing
+    ));
+    let temps = dkplus::maintenance::cleanup_stale_temp_files(
+        &lake,
+        temp_cleanup_cutoff(Utc::now()),
+        false,
+    )
+    .await
+    .context("cleaning up stale temporary files")?;
+    log.push(format!(
+        "temporary cleanup: {} candidates, {} deleted, {} already missing, {} tables skipped",
+        temps.candidates,
+        temps.deleted,
+        temps.already_missing,
+        temps.skipped_tables.len()
+    ));
+    log.push(format!(
+        "temporary directories: {} old candidates, {} deleted, {} nonempty, {} changed, {} already missing",
+        temps.directories.candidates,
+        temps.directories.deleted,
+        temps.directories.nonempty,
+        temps.directories.changed,
+        temps.directories.already_missing
     ));
     Ok(())
 }
@@ -231,6 +262,7 @@ mod tests {
         assert!(matches!(options.scope, CleanupScope::Catalog));
         assert!(!options.dry_run);
         assert_eq!(options.older_than, now - chrono::Duration::hours(12));
+        assert_eq!(temp_cleanup_cutoff(now), now - chrono::Duration::days(1));
     }
 
     #[test]

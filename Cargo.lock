@@ -1550,6 +1550,7 @@ dependencies = [
  "datafusion",
  "futures",
  "object_store",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",
